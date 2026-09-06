@@ -1,9 +1,12 @@
 # medival
 
-**M**obile (Genetic) **E**lement finder using **DIV**ergence and **AL**ignment. A parallelized sequence alignment tool for detecting Mobile Genetic Elements (MGEs) using BLAT and phylogenetic divergence analysis.
+ALASIGHT
+
+**A**pproximate **L**ocal **A**lignment for **SIG**natures of **H**orizontal **T**ransfer.
+A tool for detecting signatures of horizontal gene transfer, which might signal the presence of Mobile Genetic Elements (MGEs) using alamem and phylogenetic divergence analysis.
 ## Overview
 
-Medival finds novel MGEs by splitting query sequences into chunks, running BLAT searches in parallel across a split GTDB database, applying divergence filtering, and then running an overlap-divergence filter to identify regions supported by alignments to distantly related species. It uses the TimeTree of Life to calculate divergence times and skani for average nucleotide identity (ANI) lookups. The tool is particularly effective for horizontal gene transfer detection.
+Alasight finds signatures of horizontal gene transfer by using alamem to in parallel find all hits across a GTDB database, applying divergence filtering, and then running an overlap-divergence filter to identify regions supported by alignments to distantly related species. It uses the TimeTree of Life to calculate divergence times and skani for average nucleotide identity (ANI) lookups. We designed this tool to use HGT to find novel MGEs that do not look like reference MGE databases, by doing a string similarity search across entire bacterial genome databases.
 
 ## Installation
 Install medival:
@@ -11,73 +14,37 @@ Install medival:
 git clone https://github.com/graceoualline/medival.git
 cd medival
 ```
-Install supporting files and databases here: 
-**WARNING: We dont have a place where the database has been uploaded yet. Please email me and I'll directly transfer files to you: grace.oualline@gmail.com**
+
+We have included in the references folder a species conversion table for GTDB r214 reference genomes to NCBI annotations, though you will have to unxz it. This allows us to map those hits onto the TimeTree of Life (also included) for divergence computations.
+
+You will need to have the [GTDB r214 reference database](https://data.gtdb.ecogenomic.org/releases/release214/214.1/genomic_files_reps/gtdb_genomes_reps_r214.tar.gz) untarred somewhere (the individual fastas can stay gzipped or be decompressed, as you will).
+Then generate a file with absolute paths to all of the genomes using
+```bash
+cp -a references-compressed references-local
+cd references-local/
+find [path/to/genomes_reps_r214] > gtdb_list.txt
+unxz all_gtdb_id_and_kraken_species.txt.xz
+
+```
+
 You should have the following files:
 ```
-├── divergence_tree.tar.gz
-├── kraken2_db.tar.gz
-└── medival_gtdb_db
-    ├── blat_2bit_db
-    ├── medival_db_index.tar.gz
-    ├── skani_sketch_db.tar.gz
-    └── skani_triangle_ani95.pkl
-# you can also download these if you want to build the db/index yourself:
-gtdb_all_seqs.tar.gz
-all_gtdb_seq_kraken_species.tar.gz
+└── references-local
+    ├── all_gtdb_id_and_kraken_species.txt
+    └── TimeTree_v5_Final.nwk
 ```
-Decompress the files:
-```
-tar -xzvf divergence_tree.tar.gz
-tar -xzvf kraken2_db.tar.gz
-tar -xzvf medival_db_index.tar.gz
-```
-After decompressing the files, you should have the following:
-```
-divergence_tree/
-├── TimeTree_v5_Final.nwk
-├── TimeTree_v5.hashtable.pkl
-├── TimeTree_v5.index.npy
-├── TimeTree_v5.mins.npy
-└── TimeTree_v5.tour.npy
 
-medival_gtdb_db/
-├── blat_2bit_db/
-│   ├── split_1_output.2bit
-│   ├── split_1_output.ooc
-│   ...
-│   ├── split_137_output.2bit
-│   └── split_137_output.ooc
-├── medival_db_index.pkl
-├── skani_sketch_db/         ← skani sketches for query-vs-reference ANI
-│   └── (sketched sequences)
-└── skani_triangle_ani95.pkl ← pre-computed all-vs-all ANI ≥ 95% pairs
-
-kraken2_db/
-├── hash.k2d
-├── opts.k2d
-├── taxo.k2d
-└── unmapped.txt
+Also, you'll need to install required Python packages
 ```
 ### Required Python Packages
 ```bash
-pip install biopython tqdm pyyaml
+pip install biopython tqdm pyyaml matplotlib
 ```
 ### Prerequisites
 Please ensure you have the following tools installed:
 - Python 3.7+
-- BLAT: https://hgdownload.cse.ucsc.edu/admin/exe/linux.x86_64/blat/
-  ```bash
-  conda install -c bioconda blat
-  ```
-- Kraken2: https://github.com/DerrickWood/kraken2/wiki/Manual
-  ```bash
-  conda install -c bioconda kraken2
-  ```
 - skani: https://github.com/bluenote-1577/skani
-  ```bash
-  conda install -c bioconda skani
-  ```
+- alamem: https://github.com/yunwilliamyu/alamem
 
 ## Usage
 
@@ -87,29 +54,14 @@ Please ensure you have the following tools installed:
 # To see all input parameters
 python3 medival.py -h
 
+# build database (assumes you've already created gtdb_list.txt with correct absolute paths
+mkdir database
+mkdir tree
+./medival.py build-db -i references-local/gtdb_list.txt -d database -tr tree -n references-local/TimeTree_v5_Final.nwk --species-file references-local/all_gtdb_id_and_kraken_species.txt -t 64
+
 # command line with only required arguments
-python3 medival.py -q input.fasta -o output_directory -d /path/to/medival_database -tr /path/to/divergence_tree -k /path/to/kraken_db --threads 20
+./medival.py run -d database -q input.fasta -o out_dir -t 64
 
-# with config
-python medival.py --config config_example.yaml
-
-# with config and command line. Command-line arguments take priority over config file values.
-python medival.py --config config_example.yaml -q input.fasta -o output_directory --threads 20
-```
-#### Ready-to-Run Example (only on FAUST) Will take ~25 minutes.
-```bash
-# with config
-python3  /usr1/gouallin/blat/blat_pipeline/medival.py --config /usr1/gouallin/blat/blat_pipeline/config_example.yaml
-
-# command line only
-python3 /usr1/gouallin/blat/blat_pipeline/medival.py \
-  -q /usr1/gouallin/blat/blat_pipeline/test/acrB.fasta \
-  -o medival_test_results_acrB \
-  -d /usr1/shared/all_medival_dbs/medival_gtdb_db/ \
-  -tr /usr1/shared/all_medival_dbs/divergence_tree/ \
-  -k /usr1/shared/all_medival_dbs/kraken2_custom_db/ \
-  -t 20 \
-  -minIdentity 90
 ```
 ### Parameters
 
@@ -120,14 +72,11 @@ python3 /usr1/gouallin/blat/blat_pipeline/medival.py \
 | `-o, --output`| Name of your output directory 
 | `-d, --database`| Path to the medival database directory| |
 | `-tr, --tree`| Path to the phylogenetic tree directory |
-| `-k, --kraken`| Path to Kraken2 database |
 
 #### Optional Arguments
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `-t, --threads` | 1 | Number of threads. **Highly recommended to increase.** |
-| `-i, --index` | From database | `.pkl` file mapping sequence IDs to species, length, and tree leaf name. Use a custom index to override species assignments. |
-| `-c, --chunk` | 100000 | Chunk size (bp) for splitting large sequences before BLAT. |
 | `-s, --species` | auto-detect | Species name for all sequences in the input FASTA (replace spaces with `_`). Cannot be used with `--speciesFile`. |
 | `--speciesFile` | auto-detect | Tab-separated file assigning a species to each sequence ID. Cannot be used with `-s`. |
 | `-minScore` | 30 | Minimum BLAT alignment score. |
@@ -135,27 +84,6 @@ python3 /usr1/gouallin/blat/blat_pipeline/medival.py \
 | `--size-filter` | 150 | Discard final regions smaller than this many bp. |
 | `--cluster-size` | 0 | Merge final regions within this many bp of each other. |
 
-#### Config File
-Create a YAML configuration file for repeated analyses:
-```yaml
-# Required
-query: sequences.fasta
-output: medival_results
-database: /path/to/medival_gtdb_db/
-tree: /path/to/divergence_tree/
-kraken: /path/to/kraken2_db/
-
-# Optional
-threads: 20
-chunk: 100000
-minScore: 30
-minIdentity: 90
-size_filter: 150
-cluster_size: 0
-species: Null          # Null = auto-detect with Kraken2
-speciesFile: Null      # Null = auto-detect with Kraken2
-index: Null            # Null = use index bundled in database
-```
 
 ### Example Commands
 

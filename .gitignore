@@ -2,3 +2,8 @@
 divergence_tree
 kraken2_db
 medival_gtdb_db
+database/
+tree/
+inputs/
+test2
+references-local
