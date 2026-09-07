@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MEDIVAL - find horizontally transferred regions in a query genome.
+ALASIGHT - find horizontally transferred regions in a query genome.
 
 A query FASTA is aligned against a reference database with alamem. Hits to the
 query's own close relatives are dropped, then overlapping hits are paired and
@@ -13,7 +13,7 @@ Three subcommands:
              tables the divergence lookups need. Optional: build-db does this
              itself when -tr is not already prepared. Useful on its own when the
              machine that has ete3 is not the one building databases.
-  build-db   one-off construction of a MEDIVAL database. Resumable: every step
+  build-db   one-off construction of a ALASIGHT database. Resumable: every step
              is skipped if its output already exists. It runs no aligner and no
              skani: all ANI is computed per query, over just the references that
              query actually hits.
@@ -36,10 +36,10 @@ relatives are removed by a skani ANI check, not by taxonomy.
   <name>_final_regions_summary.tsv   one row per final region
 
 Examples:
-  medival.py build-db -i genomes.txt -d gtdb_db -tr timetree/ \\
+  alasight.py build-db -i genomes.txt -d gtdb_db -tr timetree/ \\
              -n "TimeTree v5 Final.nwk" --species-file sp.tsv
-  medival.py build-tree -n "TimeTree v5 Final.nwk" -o timetree/   # separately, if preferred
-  medival.py run -q genome.fa.gz -o results -d gtdb_db -t 32
+  alasight.py build-tree -n "TimeTree v5 Final.nwk" -o timetree/   # separately, if preferred
+  alasight.py run -q genome.fa.gz -o results -d gtdb_db -t 32
 
 Wherever a FASTA is expected you may instead pass a .txt file containing one
 FASTA path per line, and any of those files may be gzipped.
@@ -67,8 +67,8 @@ import numpy as np
 # Files that live inside a built database directory.
 DB_FASTA_LIST = "db_fasta_list.txt"
 DB_SEQ_LENGTHS = "seq_lengths.tsv"
-DB_INDEX = "medival_db_index.tsv"
-DB_CONFIG = "medival_db.json"
+DB_INDEX = "alasight_db_index.tsv"
+DB_CONFIG = "alasight_db.json"
 
 # All ANI is computed with `skani triangle -i`. Pinned to a recent release so
 # behaviour is predictable; 0.3.2 fixed -i failing outright on non-x86.
@@ -238,7 +238,7 @@ def write_tsv(path, header, rows, config_header=""):
 
 def config_header_text(args):
     """A '#' comment block recording how the run was invoked."""
-    lines = ["# MEDIVAL run configuration",
+    lines = ["# ALASIGHT run configuration",
              f"# date: {datetime.now():%Y-%m-%d %H:%M:%S}"]
     lines += [f"# {k}: {v}" for k, v in sorted(vars(args).items())]
     return "\n".join(lines) + "\n#\n"
@@ -291,7 +291,7 @@ def _one(paths, what, tree_dir):
         hint = "\nBuild into an empty directory so only one of each file is present."
     raise SystemExit(
         f"Expected exactly one {what} file in {tree_dir}, found {len(found)}: {found}{hint}\n"
-        f"  medival.py build-tree -n <timetree.nwk> -o <new empty directory>")
+        f"  alasight.py build-tree -n <timetree.nwk> -o <new empty directory>")
 
 
 class DivergenceTree:
@@ -962,7 +962,7 @@ def cmd_run(args):
     write_tsv(out_dir / f"{name}_final_regions_summary.tsv", SUMMARY_COLS,
               [[s[c] for c in SUMMARY_COLS] for s in summaries], header)
 
-    print("MEDIVAL FINISHED")
+    print("ALASIGHT FINISHED")
     print("End time:", datetime.now())
 
 
@@ -1270,7 +1270,7 @@ def cmd_build_db(args):
         if not args.newick:
             sys.exit(f"{args.tree} holds no preprocessed tree. Pass -n/--newick "
                      f"<timetree.nwk> to build it there, or build it separately with:\n"
-                     f"  medival.py build-tree -n <timetree.nwk> -o {args.tree}")
+                     f"  alasight.py build-tree -n <timetree.nwk> -o {args.tree}")
         build_tree(args.newick, args.tree)
 
     inputs = resolve_fasta_inputs(args.input)
@@ -1283,7 +1283,7 @@ def cmd_build_db(args):
     write_db_config(db_dir, args, len(inputs))
 
     print("DATABASE BUILD COMPLETE")
-    print(f"Run queries against it with:  medival.py run -q <query> -o <out> -d {db_dir}")
+    print(f"Run queries against it with:  alasight.py run -q <query> -o <out> -d {db_dir}")
     print("End time:", datetime.now())
 
 
@@ -1300,7 +1300,7 @@ def parse_args():
     run.add_argument("-q", "--query", required=True,
                      help="query FASTA, or a .txt file listing FASTA paths; .gz is fine")
     run.add_argument("-o", "--output", required=True, help="output directory")
-    run.add_argument("-d", "--database", required=True, help="MEDIVAL database directory")
+    run.add_argument("-d", "--database", required=True, help="ALASIGHT database directory")
     run.add_argument("-tr", "--tree",
                      help="preprocessed Time Tree directory; defaults to the one the "
                           "database was built against")
@@ -1320,7 +1320,7 @@ def parse_args():
                      help="merge final regions within this many bp (default: 0)")
     run.set_defaults(func=cmd_run)
 
-    build = sub.add_parser("build-db", help="build a MEDIVAL database")
+    build = sub.add_parser("build-db", help="build a ALASIGHT database")
     build.add_argument("-i", "--input", required=True,
                        help="reference multi-FASTA, or a .txt file listing FASTA paths; .gz is fine")
     build.add_argument("-d", "--database", required=True, help="database directory to create")

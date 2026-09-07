@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# This code will take in the output .txt file of Medival
+# This code will take in the output .txt file of alasight
 # and output a graph that shows all regions of detected
 # mobile elements in a genome
 # must have matplotlib installed
@@ -297,7 +297,7 @@ if __name__ == "__main__":
     #   python3 make_area_graph_known.py <file> <output> --size-filter 200 --cluster 500
     #   python3 make_area_graph_known.py <file> <output> --no-known
     if len(sys.argv) < 3:
-        print("Usage: python3 make_area_graph_known.py <path_to_medival_output.txt> <output_file> "
+        print("Usage: python3 make_area_graph_known.py <path_to_alasight.txt> <output_file> "
               "[--fasta sequences.fasta] [--all | --only N,N,...] [--size-filter N] [--cluster N] "
               "[--known | --no-known]")
         sys.exit(1)
