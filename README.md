@@ -38,7 +38,7 @@ Also, you'll need to install required Python packages
 ```
 ### Required Python Packages
 ```bash
-pip install biopython tqdm pyyaml matplotlib
+pip install biopython tqdm pyyaml matplotlib pydustmasker
 ```
 ### Prerequisites
 Please ensure you have the following tools installed:
@@ -58,7 +58,12 @@ python3 alasight.py -h
 mkdir database
 mkdir tree
 chmod +x alasight.py
-./alasight.py build-db -i references-local/gtdb_list.txt -d database -tr tree -n references-local/TimeTree_v5_Final.nwk --species-file references-local/all_gtdb_id_and_kraken_species.txt -t 64
+./alasight.py build-db \
+  -i references-local/gtdb_list.txt \
+  -d database -tr tree \
+  -n references-local/TimeTree_v5_Final.nwk \
+  -s references-local/all_gtdb_id_and_kraken_species.txt \
+  -t 64 --representatives
 
 # command line with only required arguments
 ./alasight.py run -d database -q input.fasta -o out_dir -t 64
@@ -143,8 +148,10 @@ If you want to use your own genome collection, you only need the following files
 - species_tree.nwk (in Newark file format)
 - fasta_list.txt (pointing to all the fasta files to be indexed)
 ```bash
-./alasight.py build-db -i fasta_list.txt -d database -tr tree -n species_tree.nwk -s sequence_id_to_species_id.txt -t 64
+./alasight.py build-db -i fasta_list.txt -d database -tr tree -n species_tree.nwk -s sequence_id_to_species_id.txt -t 64 [--representatives]
 ```
+If you can guarantee that your genome collection is all separate species, as it is in the GTDB r214 representative genomes collection which we use, you should set --representatives. This way we can assume that everything is distinct and don't need to run an additional 95\% ANI check.
+
 ## Phylogenetic Tree
 We use the Time Tree of Life to calculate divergence times between species. If a new .nwk file from the Time Tree becomes available, you can use the `build-tree` option directly. (normally it is called indirectly from `build-db`).
 
@@ -157,7 +164,7 @@ We use the Time Tree of Life to calculate divergence times between species. If a
 
 **Divergence filter:** Retains hits where query and reference species have <=95% ANI.
 
-**Overlap-divergence filter:** Identifies overlapping hit pairs whose reference sequences are from divergent lineages (<=95% ANI or >= 1 MYA). Always runs.
+**Overlap-divergence filter:** Identifies overlapping hit pairs whose reference sequences are from divergent lineages (<=95% ANI or >= 1 MYA). Always runs. Note that if you choose representative genomes, this is just an overlap filter.
 
 **Size + cluster filter:** Merges nearby regions and removes small ones to produce the final MGE calls.
 

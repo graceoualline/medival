@@ -13,27 +13,31 @@ Three subcommands:
              tables the divergence lookups need. Optional: build-db does this
              itself when -tr is not already prepared. Useful on its own when the
              machine that has ete3 is not the one building databases.
-  build-db   one-off construction of a ALASIGHT database. Resumable: every step
+  build-db   one-off construction of an ALASIGHT database. Resumable: every step
              is skipped if its output already exists. It runs no aligner and no
              skani: all ANI is computed per query, over just the references that
              query actually hits.
-  run        the query pipeline. Not resumable - it is fast, just rerun it.
+  run        the query pipeline. Only the alamem alignment resumes, against the
+             sidecar config it writes; every filter after it is cheap and reruns.
 
-Requires alamem and skani 0.3.0+ (0.3.2+ recommended) on PATH. ete3 is needed
-only to preprocess a newick; once a tree directory exists, build-db and run read
-it directly and need no ete3.
+Requires alamem and skani 0.3.0+ (0.3.2+ recommended) on PATH, and the
+pydustmasker package. ete3 is needed only to preprocess a newick; once a tree
+directory exists, build-db and run read it directly and need no ete3.
 
 Reference species come from --species-file at build time and drive the pairing
 step. Query species are optional output metadata; hits to the query's own close
 relatives are removed by a skani ANI check, not by taxonomy.
 
-`run` writes five files into the output directory:
+`run` writes eight files into the output directory:
 
-  <name>_alamem_results.tsv          raw alamem hits
-  <name>_first_div_output.tsv        hits kept by the ANI filter
-  <name>_overlap_div.tsv             overlapping hit pairs from different clades
-  <name>_final_regions.tsv           merged / size-filtered / clustered regions
-  <name>_final_regions_summary.tsv   one row per final region
+  <name>_alamem_results.tsv            raw alamem hits
+  <name>_alamem_config.json            size and mtime of the alignment inputs
+  <name>_first_div_output.tsv          hits kept by the ANI filter
+  <name>_overlap_div.tsv               overlapping hit pairs from different clades
+  <name>_clustered_regions.tsv         merged / size-filtered / clustered regions
+  <name>_clustered_regions_summary.tsv one row per clustered region
+  <name>_dust_regions.tsv              regions left after DUST masking
+  <name>_dust_regions_summary.tsv      one row per surviving region
 
 Examples:
   alasight.py build-db -i genomes.txt -d gtdb_db -tr timetree/ \\
@@ -103,7 +107,8 @@ META_COLS = [
     "Reference Species", "Div bt Ref Species", "ANI<95 bt Ref Seqs",
 ]
 FIXED_COLS = ["Q name", "Q size", "Q start", "Q end", "Query Species"]
-SUMMARY_COLS = FIXED_COLS + ["Num Regions", "Num Unique Species", "Avg Divergence Time"]
+SUMMARY_COLS = FIXED_COLS + ["Num Regions", "Num Unique Species", "Avg Divergence Time",
+                             "Num Tree Pairs", "Evidence"]
 
 AlamemHit = namedtuple(
     "AlamemHit",
@@ -274,6 +279,28 @@ def crude_ani_overlap(s1, e1, s2, e2, len1, len2):
     return (overlap / min(len1, len2)) * 100
 
 
+_RANK_PREFIX = re.compile(r"^[dpcofgs]__", re.IGNORECASE)
+_GTDB_SUFFIX = re.compile(r"^[A-Z]{1,2}$")
+_NOISE_TOKENS = {"candidatus"}
+
+
+def taxon_tokens(label):
+    """
+    Lowercase name tokens for a taxon label, with everything that stops a
+    TimeTree match removed: newick quoting, GTDB rank prefixes (s__, g__), GTDB
+    polyphyly suffixes (Escherichia_D -> escherichia) and 'Candidatus'.
+
+    Applied to both sides of the comparison, so the two only have to agree on
+    the names themselves and not on how they were decorated.
+    """
+    label = _RANK_PREFIX.sub("", label.strip().strip("'\""))
+    tokens = []
+    for token in re.split(r"[\s_;]+", label):
+        if token and not _GTDB_SUFFIX.match(token) and token.lower() not in _NOISE_TOKENS:
+            tokens.append(token.lower())
+    return tokens
+
+
 # ===========================================================================
 # Divergence tree
 # ===========================================================================
@@ -284,10 +311,7 @@ def _one(paths, what, tree_dir):
         return str(paths[0])
     found = sorted(p.name for p in paths)
     hint = ""
-    if not found and any(Path(tree_dir).glob("*.tour.npy")):
-        hint = ("\nThis directory holds *.tour.npy and a *.pkl, so it came from the old "
-                "preprocessing script. Regenerate it with build-tree.")
-    elif len(found) > 1:
+    if len(found) > 1:
         hint = "\nBuild into an empty directory so only one of each file is present."
     raise SystemExit(
         f"Expected exactly one {what} file in {tree_dir}, found {len(found)}: {found}{hint}\n"
@@ -306,8 +330,8 @@ class DivergenceTree:
         self.mins = np.load(_one(d.glob("*.mins.npy"), ".mins.npy", d))
         self.tour_dist = np.load(_one(d.glob("*.tour_dist.npy"), ".tour_dist.npy", d))
         # node_dists.tsv is written in Euler tour order, and first occurrences in
-        # that order are exactly preorder - which the substring fallback in
-        # leaf_name relies on. No newick is read here; only build-tree needs ete3.
+        # that order are exactly preorder - which the genus fallback in leaf_match
+        # relies on. No newick is read here; only build-tree needs ete3.
         self.node_dist = {}
         self.node_names = []
         with open(_one(d.glob("*.node_dists.tsv"), ".node_dists.tsv", d)) as f:
@@ -315,6 +339,19 @@ class DivergenceTree:
                 name, dist, step = line.rstrip("\n").split("\t")
                 self.node_dist[name] = (float(dist), int(step))
                 self.node_names.append(name)
+
+        # Normalised name -> node name, and genus -> first node in that genus.
+        # Built once here so the genus fallback is a dict lookup rather than a
+        # walk over every node, and so it can be anchored at a token boundary:
+        # 'Nitrospirae' is no longer a match for Nitrospira. First occurrence
+        # wins, which in tour order is preorder, as before.
+        self.by_norm, self.by_genus = {}, {}
+        for node_name in self.node_names:
+            key = "_".join(taxon_tokens(node_name))
+            if not key:
+                continue
+            self.by_norm.setdefault(key, node_name)
+            self.by_genus.setdefault(key.split("_", 1)[0], node_name)
 
     def _min_index(self, i, j):
         """Range minimum query over the Euler tour depths L[i:j]."""
@@ -335,31 +372,35 @@ class DivergenceTree:
         lca_step = self._min_index(min(a_step, b_step), max(a_step, b_step) + 1)
         return (a_dist + b_dist - 2 * float(self.tour_dist[lca_step])) / 2
 
-    def leaf_name(self, species):
+    def leaf_match(self, species):
         """
-        Map a species name onto the name of its node in the tree, or 'NA'.
+        (node name or 'NA', the route that matched). Routes, in the order tried:
+        'species' exact, 'genus_species' after dropping strain tokens, 'genus'
+        for a named genus node, then 'genus_member' - some species of the right
+        genus, when the genus has no node of its own. The first three are exact;
+        'genus_member' is an approximation and worth watching in the counts
+        build_index prints.
 
         Matched against the named nodes loaded from node_dists.tsv rather than by
-        searching an ete3 tree, so the three candidate forms are O(1) dict
-        lookups instead of walks over every node. Unnamed internal nodes are
-        absent from that file, but a non-empty genus can never be a substring of
-        an empty name, so omitting them changes no answer.
+        searching an ete3 tree, so every candidate is an O(1) dict lookup instead
+        of a walk over every node. Unnamed internal nodes are absent from that
+        file, and normalise to an empty key, so omitting them changes no answer.
         """
         if species == "unclassified":
-            return "NA"
-        name = "'" + "_".join(species.split(" ")) + "'"
-        parts = name.split("_")
-        # Try the full name, then genus+species, then genus alone.
-        for candidate in (name, parts[0] + "_" + parts[1] + "'" if len(parts) > 1 else None,
-                          parts[0] + "'"):
-            if candidate is not None and candidate in self.node_dist:
-                return candidate
-        # Last resort: first node whose name contains the genus, in preorder. The
-        # leading quote is deliberate - newick labels here are quoted.
-        for node_name in self.node_names:
-            if parts[0] in node_name:
-                return node_name
-        return "NA"
+            return "NA", "unclassified"
+        tokens = taxon_tokens(species)
+        if not tokens:
+            return "NA", "unnamed"
+
+        for route, key in (("species", "_".join(tokens)),
+                           ("genus_species", "_".join(tokens[:2])),
+                           ("genus", tokens[0])):
+            hit = self.by_norm.get(key)
+            if hit:
+                return hit, route
+
+        hit = self.by_genus.get(tokens[0])
+        return (hit, "genus_member") if hit else ("NA", "no_match")
 
 
 # ===========================================================================
@@ -369,18 +410,11 @@ class DivergenceTree:
 def load_index(path):
     """seq_id -> (species, length, tree_leaf_name, file_index)"""
     index = {}
-    four_col = 0
     with open(path) as f:
         for line in f:
             parts = line.rstrip("\n").split("\t")
             if len(parts) >= 5:
                 index[parts[0]] = (parts[1], int(parts[2]), parts[3], int(parts[4]))
-            elif len(parts) == 4:
-                four_col += 1
-    if four_col and not index:
-        sys.exit(f"{path} has the old four-column layout. The fifth column says which "
-                 f"reference file each sequence lives in, which the per-run triangle "
-                 f"needs. Delete it and {DB_SEQ_LENGTHS}, then rerun build-db.")
     print(f"Loaded database index: {len(index):,} sequences")
     return index
 
@@ -422,22 +456,24 @@ def _extract_hits(job):
     return out_path if written else None
 
 
-def run_skani_ani(db_dir, query_paths, query_files, hit_names, index, threads, out_dir):
+def run_skani_ani(db_dir, query_files, hit_names, index, threads, out_dir,
+                  representatives=False):
     """
-    One skani triangle over the query plus the genome files holding every
-    reference alamem hit. It answers both ANI questions the pipeline asks:
+    The ANI the pipeline needs, by whichever of two routes fits the database.
 
-      query_hits[q_name] -> reference names at >= 95% ANI to that query sequence,
-                            which filter 1 uses to drop hits to the query's own kin
-      ref_pairs          -> (min, max) reference name pairs at >= 95% ANI,
-                            which filter 2 uses to tell near-identical references apart
+      query_hits[q_name] -> reference sequence names that are the same organism
+                            as that query sequence, which filter 1 uses to drop
+                            hits to the query's own kin
+      ref_pairs          -> (min, max) reference name pairs at >= 95% ANI, which
+                            filter 2 uses to tell near-identical references apart
 
-    Only the hit sequences are compared, but they are written out one file per
-    source genome rather than pooled into a single FASTA. That grouping is load
-    bearing: pooling the same sequences into one file shifts skani's ANI by up to
-    ~1 here and moves a few percent of pairs across the 95% cutoff, whereas one
-    file per genome is byte-identical to comparing the whole genome files and
-    roughly 7x faster when a genome contributes one hit out of ten contigs.
+    With `representatives` the database holds one genome per species - GTDB's
+    species representative set, say. GTDB defines a species as a ~95% ANI cluster
+    and picks representatives so no two are within 95% of each other, so every
+    distinct pair of references is below the cutoff by construction. ref_pairs is
+    therefore empty without computing anything, which is the answer a triangle
+    would spend O(hits^2) comparisons reaching, and only the query-vs-genome half
+    is actually run.
     """
     db_files = [l.strip() for l in
                 (Path(db_dir) / DB_FASTA_LIST).read_text().splitlines() if l.strip()]
@@ -447,6 +483,102 @@ def run_skani_ani(db_dir, query_paths, query_files, hit_names, index, threads, o
         if i is not None and 0 <= i < len(db_files):
             by_file[i].add(name)
 
+    if representatives:
+        return query_vs_genomes(db_files, by_file, query_files, threads, out_dir), set()
+    return query_and_ref_triangle(db_files, by_file, query_files, hit_names,
+                                  threads, out_dir)
+
+
+def query_vs_genomes(db_files, by_file, query_files, threads, out_dir):
+    """
+    query_hits[q_name] -> every hit sequence belonging to a reference genome that
+    is the same organism as that query sequence, i.e. >= 95% ANI to it.
+
+    Whole reference genomes are compared, not individual hit contigs, because
+    that is the granularity the question is asked at: with one genome per species
+    the organism *is* the genome, and 95% ANI is where GTDB draws the species
+    boundary to begin with. Three things follow. No hit sequences need
+    extracting, so the per-genome scratch files and the -i grouping question both
+    go away. There are far fewer entries than there are hit contigs. And a short
+    contig skani cannot sketch can no longer go missing from the output and be
+    read as "not a self-hit" - a whole genome always sketches.
+
+    A self-match is expanded back to every hit sequence in that genome before
+    returning, so filter 1 keeps comparing sequence names and needs no changes.
+    """
+    indices = sorted(by_file)
+    ref_list = Path(out_dir) / "skani_ref_genomes.txt"
+    query_list = Path(out_dir) / "skani_query_list.txt"
+    ref_list.write_text("\n".join(db_files[i] for i in indices) + "\n")
+    query_list.write_text("\n".join(query_files) + "\n")
+    raw = Path(out_dir) / "skani_ani.tsv"
+
+    print(f"Computing query-vs-genome ANI over {len(indices):,} reference genome(s) "
+          f"holding {sum(len(v) for v in by_file.values()):,} hit sequence(s)...")
+    print("  reference-vs-reference ANI skipped: one genome per species, so no two "
+          "references reach 95% ANI")
+    # --qi keeps each query sequence a separate entry, since query_hits is keyed by
+    # query sequence name. References are deliberately whole files, so no --ri.
+    # Screening -s at 90 rather than 95: an initial filter, not the final cutoff.
+    run_cmd(["skani", "dist", "-t", threads, "-s", "90",
+             "--qi", "--ql", query_list, "--rl", ref_list, "-o", raw])
+
+    by_path = {db_files[i]: i for i in indices}
+    query_set = set(query_files)
+    query_hits = defaultdict(set)
+    unmatched = 0
+    with open(raw) as f:
+        f.readline()  # header
+        for line in f:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 7:
+                continue
+            try:
+                ani = float(parts[2])
+            except ValueError:
+                continue
+            if ani < 95.0:
+                continue
+            # Columns are Ref_file, Query_file, ANI, ..., Ref_name, Query_name.
+            # Orientation is read off the query file set rather than assumed, as
+            # in the triangle branch. The reference is a whole file here, so its
+            # path identifies it - Ref_name would only name its first contig.
+            if parts[1] in query_set:
+                ref_path, q_name = parts[0], parts[6]
+            elif parts[0] in query_set:
+                ref_path, q_name = parts[1], parts[5]
+            else:
+                unmatched += 1
+                continue
+            file_idx = by_path.get(ref_path)
+            if file_idx is None:
+                unmatched += 1
+                continue
+            query_hits[q_name.split()[0]] |= by_file[file_idx]
+
+    if unmatched:
+        print(f"  WARNING: {unmatched:,} skani row(s) named a file that is neither a "
+              f"query nor a listed reference genome; those self-hits were not applied")
+    print(f"  {len(query_hits):,} query sequence(s) matched a reference genome at "
+          f">= 95% ANI")
+    if not query_hits:
+        print("  note: no query sequence is within 95% ANI of any hit genome, so "
+              "filter 1 will not drop anything as a self-hit")
+    return query_hits
+
+
+def query_and_ref_triangle(db_files, by_file, query_files, hit_names, threads, out_dir):
+    """
+    One skani triangle over the query plus the hit reference sequences, for a
+    database that is not one genome per species and so needs ref_pairs computed.
+
+    Only the hit sequences are compared, but they are written out one file per
+    source genome rather than pooled into a single FASTA. That grouping is load
+    bearing: pooling the same sequences into one file shifts skani's ANI by up to
+    ~1 here and moves a few percent of pairs across the 95% cutoff, whereas one
+    file per genome is byte-identical to comparing the whole genome files and
+    roughly 7x faster when a genome contributes one hit out of ten contigs.
+    """
     scratch = Path(out_dir) / "skani_subset"
     shutil.rmtree(scratch, ignore_errors=True)
     scratch.mkdir(parents=True)
@@ -475,7 +607,7 @@ def run_skani_ani(db_dir, query_paths, query_files, hit_names, index, threads, o
         list_path.write_text("\n".join(list(query_files) + sorted(subset)) + "\n")
         raw = Path(out_dir) / "skani_ani.tsv"
         print(f"Computing ANI over {len(hit_names):,} hit reference(s)...")
-        # Screening -s at 90 rather than 95, since that's an initial filter, not the final filter
+        # Screening -s at 90 rather than 95: an initial filter, not the final cutoff.
         run_cmd(["skani", "triangle", "-t", threads, "-s", "90",
                  "-l", list_path, "-i", "-E", "-o", raw])
     finally:
@@ -571,26 +703,214 @@ def resolve_query_species(args, query_ids):
 # Alignment and ANI search
 # ===========================================================================
 
-def run_alamem(db_list, query, out_path, threads, min_len, min_ani):
-    """Align the whole query against the streamed database in a single pass."""
-    print(f"Running alamem against {db_list}...")
-    run_cmd(["alamem", db_list, query, out_path, "-k", "11",
-             "-t", threads, "-l", min_len, "--min-ani", min_ani])
+ALAMEM_FOOTER = "# ALAMEM END"
 
-    hits = []
+
+def alamem_version():
+    """The version string from `alamem --version`, or None if it cannot be read."""
+    try:
+        out = subprocess.run(["alamem", "--version"], capture_output=True, text=True,
+                             check=True).stdout
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    match = re.search(r"\d+\.\d+\.\d+", out)
+    return match.group(0) if match else None
+
+
+def alamem_header(path):
+    """
+    alamem's '# key: value' header as a dict, with Rust's Debug quoting stripped.
+
+    Case is preserved deliberately: 'Version' is the binary's version and
+    'version' is its --version option, and they differ only in case. Stops at
+    the first non-comment line, so the hit rows are never scanned.
+    """
+    header = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                if not line.startswith("#"):
+                    break          # past the header block
+                key, sep, value = line[1:].strip().partition(":")
+                if sep:
+                    header[key.strip()] = value.strip().strip('"')
+    except OSError:
+        pass
+    return header
+
+
+def alamem_settings_match(header, db_list, query, k, min_len, min_ani):
+    """
+    True when a result's header records the alignment that is about to be run.
+
+    Numbers are compared as numbers, so 90 and 90.0 agree. Paths are resolved
+    against the current directory, since alamem records them as they were given
+    on its command line - so resuming from a different working directory
+    realigns rather than risking a match on the wrong file. Any key that is
+    missing or will not parse counts as a mismatch, on the same principle: a
+    header this code does not understand is not one to trust.
+    """
+    def same_path(recorded, current):
+        try:
+            return Path(recorded).resolve() == Path(current).resolve()
+        except OSError:
+            return False
+
+    try:
+        return (int(header["kmer_size"]) == int(k)
+                and int(header["min_len"]) == int(min_len)
+                and float(header["min_ani"]) == float(min_ani)
+                and same_path(header["database"], db_list)
+                and same_path(header["y_files"], query))
+    except (KeyError, ValueError):
+        return False
+
+
+def alamem_completed(path):
+    """
+    True when the result ends with alamem's footer, i.e. alamem got to the end.
+
+    This is a stronger guarantee than the sidecar config can give: a fingerprint
+    says what a file was meant to be, the footer says the file is all there. It
+    also survives a copy between machines, which the mtime fingerprint does not.
+    Fails closed - an unrecognised or missing footer means realign.
+    """
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 4096))
+            tail = f.read().decode("utf-8", "replace")
+    except OSError:
+        return False
+    return any(line.startswith(ALAMEM_FOOTER) for line in tail.splitlines())
+
+
+def alamem_input_stats(db_list, query):
+    """
+    Size and mtime of the two inputs - the one thing alamem's header does not
+    record. It logs the paths it was given, not their contents, so a query
+    regenerated in place under the same name would otherwise be invisible and
+    a stale alignment would be reused for the whole run.
+
+    Size and mtime rather than a hash: hashing a database of millions of
+    sequences would cost more than the alignment it saves. A '.txt' list of
+    FASTA paths is only stat'ed itself, so editing one of the FASTAs it names
+    without touching the list is not detected.
+    """
+    def stat_of(path):
+        try:
+            st = Path(path).stat()
+            return {"path": str(Path(path).resolve()),
+                    "size": st.st_size, "mtime_ns": st.st_mtime_ns}
+        except OSError:
+            return {"path": str(path), "size": None, "mtime_ns": None}
+
+    return {"database": stat_of(db_list), "query": stat_of(query)}
+
+
+def run_alamem(db_list, query, out_path, config_path, threads, min_len, min_ani, k):
+    """
+    Align the whole query against the streamed database in a single pass.
+
+    The one resumable step in `run`. Alignment is the only part that costs hours
+    on a large query, so a finished result is reused when four things hold: the
+    footer says alamem finished, its header records the same thresholds and
+    paths, its version matches the installed binary, and the inputs have not
+    changed on disk since. Anything else realigns.
+
+    Three of those four come from alamem's own header and footer, which is why
+    the sidecar config is now only the inputs' size and mtime - the one thing
+    the header cannot know, since it records the paths it was given rather than
+    their contents.
+
+    The result is still written through atomic(): the footer makes an incomplete
+    result detectable, and atomic() keeps one from appearing under the real name
+    at all, which matters because the parser below skips malformed rows and a
+    truncated result would otherwise look like a smaller valid alignment.
+    """
+    out_path, config_path = Path(out_path), Path(config_path)
+    stats = alamem_input_stats(db_list, query)
+    header = alamem_header(out_path) if out_path.exists() else {}
+
+    recorded = None
+    if out_path.exists() and config_path.exists():
+        try:
+            recorded = json.loads(config_path.read_text())
+        except ValueError:
+            print(f"  WARNING: could not parse {config_path}; realigning")
+
+    # A version bump can change what counts as a hit, so a result from a
+    # different alamem is not reusable. Only a *known* mismatch blocks reuse:
+    # a result predating the header has no footer either, and the footer check
+    # already sends it back through the aligner.
+    installed = alamem_version()
+    result_version = header.get("Version")
+    version_ok = None in (installed, result_version) or installed == result_version
+    settings_ok = alamem_settings_match(header, db_list, query, k, min_len, min_ani)
+
+    if (out_path.exists() and alamem_completed(out_path)
+            and version_ok and settings_ok and recorded == stats):
+        print(f"Reusing {out_path} - alamem {result_version}, same thresholds and inputs")
+    else:
+        if out_path.exists():
+            if not alamem_completed(out_path):
+                reason = "has no completion footer, so the run did not finish"
+            elif not settings_ok:
+                reason = "records different thresholds or input paths"
+            elif not version_ok:
+                reason = f"was written by alamem {result_version}, not {installed}"
+            elif recorded is None:
+                reason = "has no matching config recording its inputs"
+            else:
+                reason = "was built from inputs that have changed on disk"
+            print(f"  {out_path} exists but {reason}; realigning")
+        print(f"Running alamem against {db_list}...")
+        with atomic(out_path) as tmp:
+            run_cmd(["alamem", db_list, query, tmp, "-k", k,
+                     "-t", threads, "-l", min_len, "--min-ani", min_ani])
+            if not alamem_completed(tmp):
+                print(f"  WARNING: alamem exited cleanly but wrote no "
+                      f"'{ALAMEM_FOOTER}' footer; the result may be incomplete")
+        # Written only after alamem succeeds, so the config never vouches for a
+        # result that does not exist.
+        with atomic(config_path) as tmp:
+            tmp.write_text(json.dumps(stats, indent=2, sort_keys=True) + "\n")
+
+    hits, malformed = [], 0
     with open(out_path) as f:
-        next(f, None)  # column header
         for line in f:
-            p = line.rstrip("\n").split("\t")
-            if len(p) != 11:
+            # alamem's config header and footer are '#' comments, as alasight's
+            # own TSVs are. Skipping by prefix rather than by position means the
+            # block can grow without this parse having to know how tall it is.
+            if not line.strip() or line.startswith("#"):
                 continue
-            hits.append(AlamemHit(
-                t_name=p[0], q_name=p[1],
-                t_size=int(p[2]), t_start=int(p[3]), t_end=int(p[4]),
-                q_size=int(p[5]), q_start=int(p[6]), q_end=int(p[7]),
-                strand=p[8], ani=float(p[9]), score=int(p[10]),
-            ))
+            p = [tok.strip() for tok in line.rstrip("\n").split("\t")]
+            # 'Reference' is the current column header, 'T name' the pre-0.1.2
+            # one; both are uncommented and have 11 fields, so neither is caught
+            # by the '#' skip above or by the field count below.
+            if p[0] in ("Reference", "T name"):
+                continue
+            if len(p) != 11:
+                malformed += 1    # counted, not ignored: see the warning below
+                continue
+            try:
+                hits.append(AlamemHit(
+                    t_name=p[0], q_name=p[1],
+                    t_size=int(p[2]), t_start=int(p[3]), t_end=int(p[4]),
+                    q_size=int(p[5]), q_start=int(p[6]), q_end=int(p[7]),
+                    strand=p[8], ani=float(p[9]), score=int(p[10]),
+                ))
+            except ValueError:
+                # Right field count, wrong types - a renamed column header or a
+                # reordered schema. Better counted than raised mid-alignment.
+                malformed += 1
     print(f"  {len(hits):,} alamem hit(s)")
+    if malformed:
+        # Every structural line is accounted for above, so anything left with the
+        # wrong field count is a real problem - a truncated file, a stale reused
+        # result, or a column added upstream that this parse has not caught up to.
+        print(f"  WARNING: {malformed:,} row(s) in {out_path} did not have 11 fields "
+              f"and were skipped")
     return hits
 
 
@@ -705,54 +1025,86 @@ def find_overlap_and_div_max(rows, tree, pairs, index):
 
 
 def _pair_group(rows, out_rows, tree, pairs, index, div_cache, ani_cache):
-    rows = sorted(rows, key=lambda x: (int(x[_QS]), int(x[_QE])))
+    """
+    Greedily pair overlapping rows from different clades, largest mutual overlap
+    first, each row used at most once.
+
+    The heap holds one entry per row - that row's best remaining partner - rather
+    than every candidate pair. The result is the same because every pair is a
+    candidate of its lower-indexed row, so the largest pair overall is always
+    some row's own best. A stale entry, one whose partner has since been taken,
+    can only overstate its overlap, so it surfaces before anything it would
+    wrongly outrank and is corrected there. That turns peak memory from one tuple
+    per candidate pair - tens of millions on a deep pileup - into one per row.
+    """
     n = len(rows)
     if n <= 1:
         return
+    rows = sorted(rows, key=lambda r: (int(r[_QS]), int(r[_QE])))
+    # Unpacked once. This is the hot loop's only input, and re-parsing these
+    # strings inside it costs more than the scanning does.
+    starts = [int(r[_QS]) for r in rows]
+    ends = [int(r[_QE]) for r in rows]
+    species = [r[_RSP] for r in rows]
+    leaves = [ref_leaf(index, r[_TNAME]) for r in rows]
+    used = [False] * n
+    rejected = set()
 
-    # Sweep for geometrically overlapping pairs, applying only the cheap
-    # species-string check here. Everything expensive is deferred to the pop phase.
-    heap = []
-    for i, row_i in enumerate(rows):
-        s1, e1, sp1 = int(row_i[_QS]), int(row_i[_QE]), row_i[_RSP]
-        best_ov = 0
-
+    def best_partner(i):
+        """
+        (overlap, j) for row i's largest eligible overlap among later rows, or
+        None. Every check here is pure row data - geometry, species string, tree
+        leaf - so it needs no cache and no tree lookup; divergence and ANI stay
+        at pop time where they are asked once per pair actually taken.
+        """
+        s1, e1, sp1, leaf1 = starts[i], ends[i], species[i], leaves[i]
+        best_ov, best_j = 0, -1
         for j in range(i + 1, n):
-            s2 = int(rows[j][_QS])
+            s2 = starts[j]
             if s2 > e1:
-                break  # sorted by start, nothing further can overlap row i
+                break                     # sorted by start; nothing later overlaps
             if e1 - s2 < best_ov:
-                break  # ceiling on any remaining overlap is below what we have
-
-            ov = overlaps(s1, e1, s2, int(rows[j][_QE]))
-            if not ov:
+                break                     # ceiling on the rest is below what we have
+            if used[j]:
                 continue
-            if sp1 == rows[j][_RSP] and sp1 != "unclassified":
+            # Rows are sorted by start, so s2 >= s1 and the overlap's left edge
+            # is always s2; only the right edge needs comparing.
+            e2 = ends[j]
+            ov = (e1 if e1 < e2 else e2) - s2
+            if ov <= 0 or ov <= best_ov:
                 continue
-
-            heapq.heappush(heap, (-ov, i, j))
-            best_ov = max(best_ov, ov)
+            sp2 = species[j]
+            # 'NA' is not an identity: two references both missing from the tree
+            # are not thereby the same clade, so they stay eligible and are
+            # arbitrated by ANI at pop time.
+            if ((leaf1 == leaves[j] and leaf1 != "NA") or sp1 == sp2) \
+                    and "unclassified" not in (sp1, sp2):
+                continue                  # same clade, by leaf or by species name
+            if rejected and (i, j) in rejected:
+                continue
+            best_ov, best_j = ov, j
             if best_ov == e1 - s1:
-                break  # full coverage, nothing better exists for row i
+                break                     # full coverage of row i, nothing better
+        return (best_ov, best_j) if best_j >= 0 else None
 
-    # Pop in decreasing overlap order. Pairs already consumed by a larger overlap
-    # are skipped before any expensive lookup happens.
-    used = set()
+    heap = []
+    for i in range(n):
+        candidate = best_partner(i)
+        if candidate:
+            heapq.heappush(heap, (-candidate[0], i, candidate[1]))
+
     while heap:
         _neg_ov, i, j = heapq.heappop(heap)
-        if i in used or j in used:
+        if used[i]:
+            continue                      # row i was consumed by a larger overlap
+        if used[j] or (rejected and (i, j) in rejected):
+            candidate = best_partner(i)   # stale; re-aim row i at what is left
+            if candidate:
+                heapq.heappush(heap, (-candidate[0], i, candidate[1]))
             continue
 
         row1, row2 = rows[i], rows[j]
-        s1, e1 = int(row1[_QS]), int(row1[_QE])
-        s2, e2 = int(row2[_QS]), int(row2[_QE])
-        sp1, sp2 = row1[_RSP], row2[_RSP]
-
-        leaf1 = ref_leaf(index, row1[_TNAME])
-        leaf2 = ref_leaf(index, row2[_TNAME])
-        if (leaf1 == leaf2 or sp1 == sp2) and "unclassified" not in (sp1, sp2):
-            continue
-
+        leaf1, leaf2 = leaves[i], leaves[j]
         div = check_cache(leaf1, leaf2, div_cache)
         if div is None:
             div = tree.divergence(leaf1, leaf2)
@@ -763,26 +1115,32 @@ def _pair_group(rows, out_rows, tree, pairs, index, div_cache, ani_cache):
             id1, id2 = row1[_TNAME], row2[_TNAME]
             ani = check_cache(id1, id2, ani_cache)
             if ani is None:
-                ani = refs_under_95(id1, id2, pairs, index, s1, e1, s2, e2)
+                ani = refs_under_95(id1, id2, pairs, index,
+                                    starts[i], ends[i], starts[j], ends[j])
                 ani_cache[(id1, id2)] = ani
 
         if not ((not isinstance(div, str) and div >= 1) or ani is True):
+            # Too close to be evidence of transfer. Both rows stay available, so
+            # record the pair and re-aim row i rather than consuming either.
+            rejected.add((i, j))
+            candidate = best_partner(i)
+            if candidate:
+                heapq.heappush(heap, (-candidate[0], i, candidate[1]))
             continue
 
         out_row = []
         for h in range(len(row1)):
-            if h in (0, 1, 9):          # Q name, Q size, Query Species
+            if h in (0, 1, 9):            # Q name, Q size, Query Species
                 out_row.append(row1[h])
             elif h == _QS:
-                out_row.append(str(max(s1, s2)))
+                out_row.append(str(max(starts[i], starts[j])))
             elif h == _QE:
-                out_row.append(str(min(e1, e2)))
+                out_row.append(str(min(ends[i], ends[j])))
             else:
                 out_row.append(f"{row1[h]},{row2[h]}")
         out_row += [str(div), str(ani)]
 
-        used.add(i)
-        used.add(j)
+        used[i] = used[j] = True
         out_rows.add(tuple(out_row))
 
 
@@ -849,23 +1207,91 @@ def format_region_row(q_name, iv):
     return out
 
 
-def format_summary_row(q_name, iv, index):
+def count_clades(ref_ids, index, pairs):
+    """
+    Distinct clades among a region's reference sequences.
+
+    References with a tree leaf are counted by leaf, as before. Those without
+    one used to collapse to a single clade however unrelated they were, since
+    'NA' was doing double duty as an identity. Here they are clustered instead:
+    two join the same clade when they come from the same reference genome file,
+    or when skani put them at >= 95% ANI. Each remaining cluster counts once.
+    """
+    parent = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    leaves, unplaced = set(), []
+    for ref_id in ref_ids:
+        leaf = ref_leaf(index, ref_id)
+        if leaf != "NA":
+            leaves.add(leaf)
+        else:
+            unplaced.append(ref_id)
+
+    # Two contigs of one genome are one organism whatever the ANI says - and with
+    # `triangle -i` a pair of short, non-homologous contigs may not be compared
+    # at all, which would otherwise split them.
+    first_in_file = {}
+    for ref_id in unplaced:
+        find(ref_id)
+        file_idx = ref_file_idx(index, ref_id)
+        if file_idx is None:
+            continue
+        if file_idx in first_in_file:
+            union(ref_id, first_in_file[file_idx])
+        else:
+            first_in_file[file_idx] = ref_id
+
+    for i, a in enumerate(unplaced):
+        for b in unplaced[i + 1:]:
+            if (min(a, b), max(a, b)) in pairs:
+                union(a, b)
+
+    return len(leaves) + len({find(r) for r in unplaced})
+
+
+def format_summary_row(q_name, iv, index, pairs):
     first = iv["rows"][0]
 
-    leaves = set()
-    for r in iv["rows"]:
-        for ref_id in str(r.get("T name", "")).split(","):
-            ref_id = ref_id.strip()
-            if ref_id:
-                leaves.add(ref_leaf(index, ref_id))
+    ref_ids = [r.strip() for row in iv["rows"]
+               for r in str(row.get("T name", "")).split(",") if r.strip()]
 
-    div_vals = []
+    # Divergence times, plus which route each contributing pair came through.
+    # A numeric divergence means the tree resolved both reference leaves; the
+    # 'unk:' string means at least one was NA and the pair passed on the ANI
+    # route instead - which in representatives mode is species distinction with
+    # no divergence-time support. Recorded rather than inferred from a blank
+    # Avg Divergence Time, since a single tree-supported pair among many ANI
+    # ones would otherwise make the whole region look tree-supported.
+    div_vals, tree_pairs, ani_pairs = [], 0, 0
     for r in iv["rows"]:
+        numeric = False
         for v in str(r.get("Div bt Ref Species", "")).split(","):
             try:
                 div_vals.append(float(v.strip()))
+                numeric = True
             except ValueError:
                 pass
+        tree_pairs += numeric
+        ani_pairs += not numeric
+
+    if not ani_pairs:
+        evidence = "tree"
+    elif not tree_pairs:
+        evidence = "ani"
+    else:
+        evidence = "mixed"
 
     return {
         "Q name": q_name,
@@ -874,12 +1300,16 @@ def format_summary_row(q_name, iv, index):
         "Q end": iv["end"],
         "Query Species": first.get("Query Species", ""),
         "Num Regions": len(iv["rows"]),
-        "Num Unique Species": len(leaves),
+        "Num Unique Species": count_clades(ref_ids, index, pairs),
+        # Empty when every pair in the region came through the ANI route rather
+        # than the tree, which is a quick way to spot ANI-only calls.
         "Avg Divergence Time": round(sum(div_vals) / len(div_vals), 4) if div_vals else "",
+        "Num Tree Pairs": tree_pairs,
+        "Evidence": evidence,
     }
 
 
-def final_regions(overlap_rows, min_size, gap, index):
+def clustered_regions(overlap_rows, min_size, gap, index, pairs):
     """Returns (region_rows, summary_rows) as lists of dicts."""
     groups = defaultdict(list)
     for row in overlap_rows:
@@ -893,7 +1323,7 @@ def final_regions(overlap_rows, min_size, gap, index):
     regions, summaries = [], []
     for q_name, ivs in groups.items():
         for iv in cluster_gap(size_filter(region_compress(ivs), min_size), gap):
-            summary = format_summary_row(q_name, iv, index)
+            summary = format_summary_row(q_name, iv, index, pairs)
             if summary["Num Unique Species"] <= 1:
                 continue  # a region needs at least two distinct clades
             regions.append(format_region_row(q_name, iv))
@@ -902,8 +1332,103 @@ def final_regions(overlap_rows, min_size, gap, index):
 
 
 # ===========================================================================
+# Filter 4 - drop low-complexity regions (DUST)
+# ===========================================================================
+
+def read_query_seqs(paths, wanted):
+    """
+    seq_id -> sequence, for just the ids in `wanted`. Only query sequences that
+    survived to a clustered region are held; everything else streams past. Goes
+    through open_fasta, so a gzipped query needs no special handling.
+    """
+    seqs = {}
+    for path in paths:
+        with open_fasta(path) as handle:
+            seq_id, buf = None, []
+            for line in handle:
+                if line.startswith(">"):
+                    if seq_id in wanted:
+                        seqs[seq_id] = "".join(buf)
+                    seq_id, buf = line[1:].split(None, 1)[0], []
+                elif seq_id in wanted:
+                    buf.append(line.strip())
+            if seq_id in wanted:
+                seqs[seq_id] = "".join(buf)
+    return seqs
+
+
+def masked_bases(seq, window, level):
+    """
+    Bases of `seq` that DUST calls low complexity.
+
+    pydustmasker implements SDUST, the same algorithm as NCBI dustmasker, and
+    agrees with `dustmasker -level -window` base for base with one exception: it
+    treats N - and any other non-ACGT character - as an ambiguous base rather
+    than as low complexity, and never includes one inside a masked interval.
+    Adding them back reproduces dustmasker exactly, and an N-rich region is no
+    more evidence of transfer than a homopolymer one. Sequences under 4 bp are
+    rejected by pydustmasker and dustmasker reports nothing for them, so both
+    count as zero.
+    """
+    from pydustmasker import DustMasker   # only this filter needs it, as with ete3
+
+    if len(seq) < 4:
+        return 0
+    ambiguous = sum(1 for c in seq if c.upper() not in "ACGT")
+    return (DustMasker(seq, window_size=window, score_threshold=level).n_masked_bases
+            + ambiguous)
+
+
+def dust_filter(regions, summaries, query_paths, max_frac, level, window):
+    """
+    Drop clustered regions that are mostly low complexity, after every other filter.
+
+    Region and summary rows describe the same intervals and are appended in
+    lockstep by clustered_regions, so both lists are filtered together and stay
+    aligned. Masked fraction is measured over seq[Q start:Q end], the same
+    half-open slice size_filter measured, so a region at the size cutoff is
+    scored over exactly the bases that got it past that cutoff.
+
+    A region whose query sequence is absent from the FASTA is kept, as is one of
+    zero length - both score 0.0, as in the standalone script.
+    """
+    if max_frac > 1:
+        return regions, summaries, 0     # no fraction exceeds 1, so skip the FASTA read
+
+    seqs = read_query_seqs(query_paths, {s["Q name"] for s in summaries})
+    kept_regions, kept_summaries, dropped = [], [], 0
+    for region, summary in zip(regions, summaries):
+        seq = seqs.get(summary["Q name"])
+        start, end = int(summary["Q start"]), int(summary["Q end"])
+        length = end - start
+        frac = 0.0
+        if seq is not None and length > 0:
+            frac = masked_bases(seq[start:end], window, level) / length
+        if frac >= max_frac:
+            dropped += 1
+            continue
+        kept_regions.append(region)
+        kept_summaries.append(summary)
+
+    print(f"  {len(kept_summaries):,} of {len(summaries):,} region(s) kept; "
+          f"{dropped:,} dropped at >= {max_frac:g} masked")
+    return kept_regions, kept_summaries, dropped
+
+
+# ===========================================================================
 # Pipeline
 # ===========================================================================
+
+def write_region_pair(out_dir, name, stem, regions, summaries, header):
+    """
+    Write a region table and its summary. Called once per step that produces
+    regions, so each filter's output stays on disk like every other step's.
+    """
+    region_cols = FIXED_COLS + META_COLS
+    write_tsv(out_dir / f"{name}_{stem}.tsv", region_cols,
+              [[r[c] for c in region_cols] for r in regions], header)
+    write_tsv(out_dir / f"{name}_{stem}_summary.tsv", SUMMARY_COLS,
+              [[s[c] for c in SUMMARY_COLS] for s in summaries], header)
 
 def cmd_run(args):
     out_dir = Path(args.output)
@@ -913,6 +1438,7 @@ def cmd_run(args):
     header = config_header_text(args)
 
     require_skani()
+    import pydustmasker  # noqa: F401 - fail fast before alamem, not after
 
     # -tr is optional: the database records the tree it was built against, and
     # the index's leaf names only mean anything relative to that tree.
@@ -924,9 +1450,17 @@ def cmd_run(args):
         print(f"  WARNING: -tr {args.tree} is not the tree this database was built against "
               f"({config['tree']}). The index's leaf names came from that tree.")
 
+    # Recorded at build time, since it is a property of the reference set rather
+    # than of a query; the flag only overrides that record. Not inferred, because
+    # skipping the reference-vs-reference ANI is only sound for a database that
+    # really does hold one genome per species.
+    representatives = (args.ref_representatives if args.ref_representatives is not None
+                       else bool(config.get("representatives")))
+
     print("Start time:", datetime.now())
     print(f"Query: {args.query}\nDatabase: {db_dir}\nTree: {tree_dir}\n"
-          f"Threads: {args.threads}\n")
+          f"Threads: {args.threads}\n"
+          f"One genome per species: {representatives}\n")
 
     tree = DivergenceTree(tree_dir)
     index = load_index(db_dir / DB_INDEX)
@@ -938,12 +1472,13 @@ def cmd_run(args):
 
     hits = run_alamem(db_dir / DB_FASTA_LIST, args.query,
                       out_dir / f"{name}_alamem_results.tsv",
-                      args.threads, args.min_len, args.min_ani)
+                      out_dir / f"{name}_alamem_config.json",
+                      args.threads, args.min_len, args.min_ani, args.kmer_size)
 
     # After alamem, so only the references it actually hit are compared.
     query_hits, ref_pairs = run_skani_ani(
-        db_dir, query_paths, [str(p) for p in query_paths],
-        {h.t_name for h in hits}, index, args.threads, out_dir)
+        db_dir, [str(p) for p in query_paths],
+        {h.t_name for h in hits}, index, args.threads, out_dir, representatives)
 
     print("Filtering out references too similar to the query...")
     first_div = first_divergence_filter(hits, query_species, index,
@@ -954,13 +1489,21 @@ def cmd_run(args):
     overlap = find_overlap_and_div_max(compress(first_div), tree, ref_pairs, index)
     write_tsv(out_dir / f"{name}_overlap_div.tsv", OVERLAP_HEADER, overlap, header)
 
-    print("Building final regions...")
-    regions, summaries = final_regions(overlap, args.size_filter, args.cluster_size, index)
-    region_cols = FIXED_COLS + META_COLS
-    write_tsv(out_dir / f"{name}_final_regions.tsv", region_cols,
-              [[r[c] for c in region_cols] for r in regions], header)
-    write_tsv(out_dir / f"{name}_final_regions_summary.tsv", SUMMARY_COLS,
-              [[s[c] for c in SUMMARY_COLS] for s in summaries], header)
+    print("Building clustered regions...")
+    regions, summaries = clustered_regions(overlap, args.size_filter, args.cluster_size,
+                                           index, ref_pairs)
+    write_region_pair(out_dir, name, "clustered_regions", regions, summaries, header)
+
+    # Filter 4 - low complexity, last so it only sees regions everything else kept.
+    # Its own pair of files, so the pre-DUST regions above survive on disk.
+    print("Filtering low-complexity regions...")
+    regions, summaries, n_dust = dust_filter(regions, summaries, query_paths,
+                                             args.max_masked_frac,
+                                             args.dustmasker_level,
+                                             args.dustmasker_window)
+    dust_header = header + (f"# dust filter: dropped {n_dust} region(s) with masked "
+                            f"fraction >= {args.max_masked_frac}\n#\n")
+    write_region_pair(out_dir, name, "dust_regions", regions, summaries, dust_header)
 
     print("ALASIGHT FINISHED")
     print("End time:", datetime.now())
@@ -1192,6 +1735,7 @@ def write_db_config(db_dir, args, n_reference_files):
         "species_file": str(Path(args.species_file).resolve()),
         "reference_input": str(Path(args.input).resolve()),
         "n_reference_files": n_reference_files,
+        "representatives": bool(getattr(args, "representatives", False)),
     })
     with atomic(Path(db_dir) / DB_CONFIG) as tmp:
         tmp.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n")
@@ -1210,7 +1754,7 @@ def read_db_config(db_dir):
         return {}
 
 
-def build_index(db_dir, species_file, tree_dir):
+def build_index(db_dir, species_file, tree_dir, representatives=False):
     """seq_id -> species, length, tree leaf name, as a TSV."""
     out_path = db_dir / DB_INDEX
     if out_path.exists():
@@ -1224,6 +1768,8 @@ def build_index(db_dir, species_file, tree_dir):
 
     print("Building database index...")
     leaf_cache = {}
+    seqs_by_route = defaultdict(int)
+    species_by_route = defaultdict(int)
     total = covered = unusable = 0
     with atomic(out_path) as tmp, open(db_dir / DB_SEQ_LENGTHS) as lengths, open(tmp, "w") as out:
         for line in lengths:
@@ -1234,12 +1780,15 @@ def build_index(db_dir, species_file, tree_dir):
             file_idx = parts[2] if len(parts) > 2 else "0"
             species = species_map.get(seq_id, "unclassified")
             if species not in leaf_cache:
-                leaf_cache[species] = tree.leaf_name(species)
-            out.write(f"{seq_id}\t{species}\t{length}\t{leaf_cache[species]}\t{file_idx}\n")
+                leaf_cache[species] = tree.leaf_match(species)
+                species_by_route[leaf_cache[species][1]] += 1
+            leaf, route = leaf_cache[species]
+            seqs_by_route[route] += 1
+            out.write(f"{seq_id}\t{species}\t{length}\t{leaf}\t{file_idx}\n")
             total += 1
             if seq_id in species_map:
                 covered += 1
-            if leaf_cache[species] == "NA":
+            if leaf == "NA":
                 unusable += 1
 
     print(f"  index written to {out_path}")
@@ -1248,20 +1797,47 @@ def build_index(db_dir, species_file, tree_dir):
           f"{total - unusable:,} with a usable tree leaf "
           f"({100.0 * (total - unusable) / total if total else 0:.1f}%)")
     print(f"  {len(leaf_cache):,} distinct species, "
-          f"{sum(1 for v in leaf_cache.values() if v == 'NA'):,} of which are not in the tree")
+          f"{sum(1 for leaf, _ in leaf_cache.values() if leaf == 'NA'):,} "
+          f"of which are not in the tree")
+
+    # Per-route counts, because the sequence-weighted percentage above is
+    # dominated by whichever species happen to have the most contigs.
+    print("  match route      species     sequences")
+    for route in ("species", "genus_species", "genus", "genus_member",
+                  "no_match", "unclassified", "unnamed"):
+        if species_by_route[route]:
+            print(f"  {route:<14} {species_by_route[route]:>9,} {seqs_by_route[route]:>13,}")
+
+    unlabelled = seqs_by_route["unclassified"] + seqs_by_route["unnamed"]
+    labelled = total - unlabelled
+    # First, because an ID mismatch also trips the two warnings below and this is
+    # the one that names the cause.
     if total and covered / total < 0.5:
         print("  WARNING: over half the references are missing from the species file. "
               "Check that its first column holds sequence IDs, not assembly accessions.")
-    if total and (total - unusable) / total < 0.5:
-        print("  WARNING: over half the references have no tree leaf and cannot contribute "
-              "to the pairing step, so most regions will be dropped.")
+    if labelled and (total - unusable) / labelled < 0.5:
+        if representatives:
+            # Not a warning here: with one genome per species, ref_pairs is empty,
+            # so a pair with no tree leaf passes on species distinction instead of
+            # being dropped. It just arrives with no divergence time attached.
+            print("  NOTE: over half the labelled references have no tree leaf. With one "
+                  "genome per species those pairs still pass, on species distinction "
+                  "alone, but carry no divergence time - the Evidence column in the "
+                  "region summary says which route each region used.")
+        else:
+            print("  WARNING: over half the labelled references have no tree leaf and cannot "
+                  "contribute to the pairing step, so most regions will be dropped.")
+    if total and unlabelled / total > 0.25:
+        print(f"  WARNING: {100.0 * unlabelled / total:.0f}% of references have no species "
+              f"label at all. They can still pair through the ANI route, with no "
+              f"divergence-time support.")
 
 
 def cmd_build_db(args):
     db_dir = Path(args.database)
     db_dir.mkdir(parents=True, exist_ok=True)
 
-    require_skani()
+    #require_skani()
     print("Start time:", datetime.now())
 
     # The tree is an input to the index step, so prepare it first if needed.
@@ -1278,7 +1854,7 @@ def cmd_build_db(args):
 
     build_seq_lengths(inputs, db_dir / DB_SEQ_LENGTHS, args.threads)
     build_fasta_list(inputs, db_dir / DB_FASTA_LIST)
-    build_index(db_dir, args.species_file, args.tree)
+    build_index(db_dir, args.species_file, args.tree, args.representatives)
 
     write_db_config(db_dir, args, len(inputs))
 
@@ -1310,17 +1886,32 @@ def parse_args():
                      help="label every query sequence with this species (output metadata only; "
                           "no filter uses it)")
     run.add_argument("-t", "--threads", type=int, default=os.cpu_count() or 1)
+    run.add_argument("--ref-representatives", action=argparse.BooleanOptionalAction,
+                     default=None,
+                     help="the database holds one genome per species, so no two references "
+                          "reach 95%% ANI and the reference-vs-reference ANI can be skipped "
+                          "(default: whatever build-db recorded)")
+    run.add_argument("-k", "--kmer-size", type=int, default=11,
+                     help="alamem seed k-mer size (default: 11, matching alamem's own "
+                          "default); larger is faster and less sensitive")
     run.add_argument("--min-len", type=int, default=40,
                      help="minimum alamem hit length in bp (default: 40)")
     run.add_argument("--min-ani", type=float, default=90.0,
                      help="minimum percent identity / ANI of a hit (default: 90)")
     run.add_argument("--size-filter", type=int, default=150,
-                     help="drop final regions smaller than this many bp (default: 150)")
+                     help="drop clustered regions smaller than this many bp (default: 150)")
     run.add_argument("--cluster-size", type=int, default=0,
-                     help="merge final regions within this many bp (default: 0)")
+                     help="merge clustered regions within this many bp (default: 0)")
+    run.add_argument("--max-masked-frac", type=float, default=0.5,
+                     help="drop a clustered region when this fraction or more of its bases are "
+                          "DUST-masked; any value above 1 disables the filter (default: 0.5)")
+    run.add_argument("--dustmasker-level", type=int, default=20,
+                     help="DUST score threshold, as dustmasker -level (default: 20)")
+    run.add_argument("--dustmasker-window", type=int, default=64,
+                     help="DUST window size, as dustmasker -window (default: 64)")
     run.set_defaults(func=cmd_run)
 
-    build = sub.add_parser("build-db", help="build a ALASIGHT database")
+    build = sub.add_parser("build-db", help="build an ALASIGHT database")
     build.add_argument("-i", "--input", required=True,
                        help="reference multi-FASTA, or a .txt file listing FASTA paths; .gz is fine")
     build.add_argument("-d", "--database", required=True, help="database directory to create")
@@ -1331,6 +1922,10 @@ def parse_args():
     build.add_argument("-s", "--species-file", required=True,
                        help="TSV of reference sequence ID and species; the divergence pairing "
                             "depends on it, so it is required")
+    build.add_argument("--representatives", action="store_true",
+                       help="the reference set holds one genome per species, e.g. the GTDB "
+                            "species representatives; recorded in the database so `run` can "
+                            "skip the reference-vs-reference ANI entirely")
     build.add_argument("-t", "--threads", type=int, default=os.cpu_count() or 1)
     build.set_defaults(func=cmd_build_db)
 
