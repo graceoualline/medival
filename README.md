@@ -23,7 +23,7 @@ Then generate a file with absolute paths to all of the genomes using
 cp -a references-compressed references-local
 cd references-local/
 find [path/to/genomes_reps_r214] > gtdb_list.txt
-unxz all_gtdb_id_and_kraken_species.txt.xz
+unxz *.xz
 
 ```
 
