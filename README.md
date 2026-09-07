@@ -30,7 +30,7 @@ unxz *.xz
 You should have the following files:
 ```
 └── references-local
-    ├── all_gtdb_id_and_kraken_species.txt
+    ├── gtdbr214rep_to_ncbi.tsv
     └── TimeTree_v5_Final.nwk
 ```
 
@@ -62,7 +62,7 @@ chmod +x alasight.py
   -i references-local/gtdb_list.txt \
   -d database -tr tree \
   -n references-local/TimeTree_v5_Final.nwk \
-  -s references-local/all_gtdb_id_and_kraken_species.txt \
+  -s references-local/gtdbr214rep_to_ncbi.tsv \
   -t 64 --representatives
 
 # command line with only required arguments
