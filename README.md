@@ -164,7 +164,7 @@ We use the Time Tree of Life to calculate divergence times between species. If a
 
 ## Citation
 
-If you use medival in your research, please cite:
+If you use alasight in your research, please cite:
 [Add later]
 
 ## Support
