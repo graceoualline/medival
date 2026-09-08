@@ -28,6 +28,27 @@ known = None
 # Fallback x-axis range used when no FASTA is provided or sequence ID is not found
 X_MAX_DEFAULT = 100000
 
+# dpi both savefig calls use, so min_draw_width below can work out how many
+# pixels an axis really gets.
+SAVE_DPI = 300
+
+
+def min_draw_width(ax, x_max):
+    """
+    Width in data units of one pixel of this axis.
+
+    A rectangle narrower than a pixel cannot be drawn honestly. On a 5 Mb
+    chromosome an axis holds roughly 2,600 bp per pixel, so a 200 bp region is
+    0.08 px wide: drawn plainly it antialiases away to nothing, and drawn with
+    the 1 pt edge this script used to give it, it paints about 4 px - a 50x
+    overstatement, which is what turned a genome with a few small regions into
+    a solid red band. Widening it to exactly one pixel keeps it visible while
+    overstating it as little as a raster allows.
+    """
+    fig = ax.get_figure()
+    axis_px = (fig.get_size_inches()[0] * SAVE_DPI * ax.get_position().width)
+    return x_max / max(1.0, axis_px)
+
 
 # Definition of what a "known" Q name is
 # The middle two fields must be integers.
@@ -46,14 +67,26 @@ def is_known_name(q_name):
 
 def compress(intervals):
     """Merge overlapping or adjacent intervals. Carries a 3rd element (e.g. num_species)
-    by taking the max when merging; intervals without a 3rd element are also supported."""
+    by taking the max when merging; intervals without a 3rd element are also supported.
+
+    Intervals are half-open [start, end), as alasight writes them: Q end is one
+    past the last base, so a region's length is end - start.
+    """
     if not intervals:
         return []
     sorted_ivs = sorted(intervals, key=lambda x: x[0])
     merged = [list(sorted_ivs[0])]
     for iv in sorted_ivs[1:]:
         s, e = iv[0], iv[1]
-        if s <= merged[-1][1] + 1:
+        # FIX: was `s <= merged[-1][1] + 1`, which is adjacency for CLOSED
+        # intervals - under [a, b] the next one is contiguous at s == b + 1.
+        # These are half-open, so contiguity is s == b, and the +1 was fusing
+        # regions separated by one uncovered base. That matters on real output:
+        # at the default --cluster-size 0 alasight leaves two regions exactly
+        # one base apart precisely because that base had fewer than two clades
+        # on it, and the merge below carries the label by max, so the weaker
+        # region would inherit the stronger one's clade count.
+        if s <= merged[-1][1]:
             merged[-1][1] = max(merged[-1][1], e)
             if len(iv) > 2 and len(merged[-1]) > 2:
                 merged[-1][2] = max(merged[-1][2], iv[2])
@@ -92,20 +125,31 @@ def apply_filters(intervals, min_size, gap):
 
 
 def compute_score(raw_intervals, plasmid_regions, q_sizes, min_size, cluster_dist):
-    """Compute detection metrics matching interactive_filter.py exactly.
-    Operates on raw (uncompressed) intervals and applies size filter then cluster,
-    matching the 'Filter BEFORE clustering' default in interactive_filter.py.
+    """Compute detection metrics over the same intervals the figure draws.
+    Applies compress, then size filter, then cluster - the order the plot uses
+    (compress happens in get_coor, apply_filters runs after it).
     Uses actual entry count as denominator (interactive_filter.py hardcodes 100
     for its specific 100-plasmid test set).
     """
     arg_metrics = []
     for key in plasmid_regions:
         p_start, p_end = plasmid_regions[key]
+        # NOTE: p_start/p_end come from the Q name, and are compared below
+        # against alasight coordinates, which are 0-based with an exclusive
+        # end. If whatever generated those names used 1-based inclusive bounds
+        # (the usual annotation convention) then mge_bp is short by one and
+        # every overlap is shifted by one. Worth confirming against that script.
         mge_bp = p_end - p_start
         host_bp = max(0, q_sizes.get(key, 0) - mge_bp)
 
-        # Mirror interactive_filter.py: size_filter first, then cluster
-        intervals = size_filter(raw_intervals.get(key, []), min_size)
+        # FIX: compress first, as the plot does. Without it the printed scores
+        # could contradict the figure outright - a pair of sub-threshold
+        # regions that compress fuses past --size-filter is drawn as a red
+        # block while the score, filtering the unfused pair, reports 0% found.
+        # It also stops bases being counted twice in bp_within / bp_outside
+        # when the input intervals overlap, as they do in a hits file rather
+        # than a region summary.
+        intervals = size_filter(compress(raw_intervals.get(key, [])), min_size)
         intervals = cluster_gap(intervals, cluster_dist)
 
         bp_within = bp_outside = 0
@@ -165,12 +209,18 @@ def graph_genome(name_tuple, coordinates, row, length, plasmid_region=None, x_ma
             max_coor = p_end
 
     # Draw detected hit regions on top (merged to avoid muddy overlap)
+    min_w = min_draw_width(ax, x_max)
     for iv in coordinates:
         start1, end1 = iv[0], iv[1]
         ns = iv[2] if len(iv) > 2 else None
+        # FIX: was linewidth=1, edgecolor='red'. A 1 pt edge is drawn at a
+        # fixed size in points no matter how few bases the rectangle spans, so
+        # every sub-pixel region painted ~4 px of solid red and a sparse genome
+        # looked fully covered. No edge, and never thinner than one pixel, so
+        # a region stays visible without claiming more width than it has.
         rect1 = patches.Rectangle(
-            (start1, 0), end1 - start1, 1,
-            linewidth=1, edgecolor='red', facecolor='red', alpha=0.5
+            (start1, 0), max(end1 - start1, min_w), 1,
+            linewidth=0, edgecolor='none', facecolor='red', alpha=0.5
         )
         ax.add_patch(rect1)
         if ns is not None:
@@ -432,9 +482,11 @@ if __name__ == "__main__":
             for iv in genome_positions[gene]:
                 start1, end1 = iv[0], iv[1]
                 ns = iv[2] if len(iv) > 2 else None
+                # FIX: as in graph_genome - no fixed-size edge, and never
+                # thinner than one pixel. See min_draw_width.
                 ax.add_patch(patches.Rectangle(
-                    (start1, 0), end1 - start1, 1,
-                    linewidth=1, edgecolor='red', facecolor='red', alpha=0.5
+                    (start1, 0), max(end1 - start1, min_draw_width(ax, x_max)), 1,
+                    linewidth=0, edgecolor='none', facecolor='red', alpha=0.5
                 ))
                 if ns is not None:
                     ax.text((start1 + end1) / 2, 0.5, str(ns),
@@ -452,7 +504,7 @@ if __name__ == "__main__":
         plt.tight_layout()
         plt.subplots_adjust(hspace=0.8)
         out_path = output_file
-        plt.savefig(out_path, dpi=150)
+        plt.savefig(out_path, dpi=SAVE_DPI)
         plt.show()
         plt.close(fig)
     else:
@@ -475,6 +527,6 @@ if __name__ == "__main__":
             gene_num += num_rows
             plt.tight_layout()
             plt.subplots_adjust(hspace=0.8)
-            plt.savefig(f'{output_file}_plot_{i+1}.png')
+            plt.savefig(f'{output_file}_plot_{i+1}.png', dpi=SAVE_DPI)
             plt.show()
             plt.close(fig)

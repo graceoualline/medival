@@ -303,6 +303,6 @@ if __name__ == "__main__":
     bar.set_label('Clades', fontsize=8)
     bar.outline.set_linewidth(0.4)
 
-    plt.savefig(output_file, dpi=150)
+    plt.savefig(output_file, dpi=300)
     print(f"Wrote {output_file}")
     plt.close(fig)
