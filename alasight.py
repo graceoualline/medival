@@ -5,7 +5,8 @@ ALASIGHT - find horizontally transferred regions in a query genome.
 A query FASTA is aligned against a reference database with alamem. Hits to the
 query's own close relatives are dropped, then overlapping hits are paired and
 kept only where the two reference species are separated by enough divergence
-time on the Time Tree of Life.
+time on the Time Tree of Life. Regions are read off query positions covered by
+two or more such clades, rather than by pairing hits against each other.
 
 Three subcommands:
 
@@ -14,9 +15,9 @@ Three subcommands:
              itself when -tr is not already prepared. Useful on its own when the
              machine that has ete3 is not the one building databases.
   build-db   one-off construction of an ALASIGHT database. Resumable: every step
-             is skipped if its output already exists. It runs no aligner and no
-             skani: all ANI is computed per query, over just the references that
-             query actually hits.
+             is skipped if its output already exists. It runs no aligner, and
+             runs skani only for --skani-sketch, which prebuilds the reference
+             sketches so `run` searches them instead of re-sketching per query.
   run        the query pipeline. Only the alamem alignment resumes, against the
              sidecar config it writes; every filter after it is cheap and reruns.
 
@@ -50,10 +51,10 @@ FASTA path per line, and any of those files may be gzipped.
 """
 
 import argparse
+import bisect
 import contextlib
 import csv
 import gzip
-import heapq
 import json
 import os
 import re
@@ -73,6 +74,7 @@ DB_FASTA_LIST = "db_fasta_list.txt"
 DB_SEQ_LENGTHS = "seq_lengths.tsv"
 DB_INDEX = "alasight_db_index.tsv"
 DB_CONFIG = "alasight_db.json"
+DB_SKANI_SKETCH = "skani_sketch"
 
 # All ANI is computed with `skani triangle -i`. Pinned to a recent release so
 # behaviour is predictable; 0.3.2 fixed -i failing outright on non-x86.
@@ -93,7 +95,11 @@ FIRST_DIV_HEADER = [
     "T name", "T size", "T start", "T end",
     "Percent Identity", "Query Species", "Reference Species",
 ]
-OVERLAP_HEADER = FIRST_DIV_HEADER + ["Div bt Ref Species", "ANI<95 bt Ref Seqs"]
+# Reference-side columns of a region, one token per contributing hit.
+REGION_META_COLS = [
+    "T name", "T size", "T start", "T end", "Percent Identity",
+    "Reference Species", "Clade",
+]
 
 # Positions within a FIRST_DIV_HEADER row, used by the overlap pairing.
 _QS = 2       # Q start
@@ -101,14 +107,10 @@ _QE = 3       # Q end
 _TNAME = 4    # T name
 _RSP = 10     # Reference Species
 
-# Reference-side columns aggregated across merged rows; order defines output order.
-META_COLS = [
-    "T name", "T size", "T start", "T end", "Percent Identity",
-    "Reference Species", "Div bt Ref Species", "ANI<95 bt Ref Seqs",
-]
 FIXED_COLS = ["Q name", "Q size", "Q start", "Q end", "Query Species"]
-SUMMARY_COLS = FIXED_COLS + ["Num Regions", "Num Unique Species", "Avg Divergence Time",
-                             "Num Tree Pairs", "Evidence"]
+# How much support a region has, and of what kind.
+SUMMARY_COLS = FIXED_COLS + ["Num Hits", "Num Clades", "Peak Clades",
+                             "Avg Divergence Time", "Max Divergence Time", "Evidence"]
 
 AlamemHit = namedtuple(
     "AlamemHit",
@@ -457,7 +459,7 @@ def _extract_hits(job):
 
 
 def run_skani_ani(db_dir, query_files, hit_names, index, threads, out_dir,
-                  representatives=False):
+                  representatives=False, sketch_db=None):
     """
     The ANI the pipeline needs, by whichever of two routes fits the database.
 
@@ -484,12 +486,13 @@ def run_skani_ani(db_dir, query_files, hit_names, index, threads, out_dir,
             by_file[i].add(name)
 
     if representatives:
-        return query_vs_genomes(db_files, by_file, query_files, threads, out_dir), set()
+        return query_vs_genomes(db_files, by_file, query_files, threads, out_dir,
+                                sketch_db), set()
     return query_and_ref_triangle(db_files, by_file, query_files, hit_names,
                                   threads, out_dir)
 
 
-def query_vs_genomes(db_files, by_file, query_files, threads, out_dir):
+def query_vs_genomes(db_files, by_file, query_files, threads, out_dir, sketch_db=None):
     """
     query_hits[q_name] -> every hit sequence belonging to a reference genome that
     is the same organism as that query sequence, i.e. >= 95% ANI to it.
@@ -497,36 +500,52 @@ def query_vs_genomes(db_files, by_file, query_files, threads, out_dir):
     Whole reference genomes are compared, not individual hit contigs, because
     that is the granularity the question is asked at: with one genome per species
     the organism *is* the genome, and 95% ANI is where GTDB draws the species
-    boundary to begin with. Three things follow. No hit sequences need
-    extracting, so the per-genome scratch files and the -i grouping question both
-    go away. There are far fewer entries than there are hit contigs. And a short
-    contig skani cannot sketch can no longer go missing from the output and be
-    read as "not a self-hit" - a whole genome always sketches.
+    boundary to begin with. No hit sequences need extracting, so the per-genome
+    scratch files and the -i grouping question both go away, and a short contig
+    skani cannot sketch can no longer go missing from the output and be read as
+    "not a self-hit" - a whole genome always sketches.
+
+    With `sketch_db`, `skani search` reads sketches built once at build time
+    instead of re-sketching the hit genomes on every query. That searches the
+    whole database rather than only the genomes alamem hit, which is why matches
+    to genomes with no hits are expected below rather than anomalous.
 
     A self-match is expanded back to every hit sequence in that genome before
     returning, so filter 1 keeps comparing sequence names and needs no changes.
     """
-    indices = sorted(by_file)
-    ref_list = Path(out_dir) / "skani_ref_genomes.txt"
     query_list = Path(out_dir) / "skani_query_list.txt"
-    ref_list.write_text("\n".join(db_files[i] for i in indices) + "\n")
     query_list.write_text("\n".join(query_files) + "\n")
     raw = Path(out_dir) / "skani_ani.tsv"
+    n_hit_seqs = sum(len(v) for v in by_file.values())
 
-    print(f"Computing query-vs-genome ANI over {len(indices):,} reference genome(s) "
-          f"holding {sum(len(v) for v in by_file.values()):,} hit sequence(s)...")
-    print("  reference-vs-reference ANI skipped: one genome per species, so no two "
-          "references reach 95% ANI")
-    # --qi keeps each query sequence a separate entry, since query_hits is keyed by
-    # query sequence name. References are deliberately whole files, so no --ri.
-    # Screening -s at 90 rather than 95: an initial filter, not the final cutoff.
-    run_cmd(["skani", "dist", "-t", threads, "-s", "90",
-             "--qi", "--ql", query_list, "--rl", ref_list, "-o", raw])
+    if sketch_db:
+        print(f"Searching {len(db_files):,} prebuilt reference sketch(es) for the query; "
+              f"{n_hit_seqs:,} hit sequence(s) across {len(by_file):,} genome(s)...")
+        print("  reference-vs-reference ANI skipped: one genome per species, so no two "
+              "references reach 95% ANI")
+        # --qi keeps each query sequence a separate entry, since query_hits is
+        # keyed by query sequence name.
+        run_cmd(["skani", "search", "-t", threads, "-d", sketch_db,
+                 "--qi", "--ql", query_list, "-o", raw])
+    else:
+        indices = sorted(by_file)
+        ref_list = Path(out_dir) / "skani_ref_genomes.txt"
+        ref_list.write_text("\n".join(db_files[i] for i in indices) + "\n")
+        print(f"Computing query-vs-genome ANI over {len(indices):,} reference genome(s) "
+              f"holding {n_hit_seqs:,} hit sequence(s)...")
+        print("  reference-vs-reference ANI skipped: one genome per species, so no two "
+              "references reach 95% ANI")
+        # Screening -s at 90 rather than 95: an initial filter, not the final cutoff.
+        run_cmd(["skani", "dist", "-t", threads, "-s", "90",
+                 "--qi", "--ql", query_list, "--rl", ref_list, "-o", raw])
 
-    by_path = {db_files[i]: i for i in indices}
+    # Every database genome, not only the hit ones: a search covers the whole
+    # database, and a match to a genome that contributed no hits is a no-op
+    # rather than something to warn about.
+    by_path = {path: i for i, path in enumerate(db_files)}
     query_set = set(query_files)
     query_hits = defaultdict(set)
-    unmatched = 0
+    no_hits = unknown = 0
     with open(raw) as f:
         f.readline()  # header
         for line in f:
@@ -540,27 +559,32 @@ def query_vs_genomes(db_files, by_file, query_files, threads, out_dir):
             if ani < 95.0:
                 continue
             # Columns are Ref_file, Query_file, ANI, ..., Ref_name, Query_name.
-            # Orientation is read off the query file set rather than assumed, as
-            # in the triangle branch. The reference is a whole file here, so its
-            # path identifies it - Ref_name would only name its first contig.
+            # Orientation is read off the query file set rather than assumed.
+            # The reference is a whole file here, so its path identifies it -
+            # Ref_name would only name its first contig.
             if parts[1] in query_set:
                 ref_path, q_name = parts[0], parts[6]
             elif parts[0] in query_set:
                 ref_path, q_name = parts[1], parts[5]
             else:
-                unmatched += 1
+                unknown += 1
                 continue
             file_idx = by_path.get(ref_path)
             if file_idx is None:
-                unmatched += 1
+                unknown += 1
                 continue
-            query_hits[q_name.split()[0]] |= by_file[file_idx]
+            hits = by_file.get(file_idx)
+            if not hits:
+                no_hits += 1          # same organism, but it contributed no hits
+                continue
+            query_hits[q_name.split()[0]] |= hits
 
-    if unmatched:
-        print(f"  WARNING: {unmatched:,} skani row(s) named a file that is neither a "
-              f"query nor a listed reference genome; those self-hits were not applied")
+    if unknown:
+        print(f"  WARNING: {unknown:,} skani row(s) named a file that is neither a query "
+              f"nor a database reference; those self-hits were not applied")
     print(f"  {len(query_hits):,} query sequence(s) matched a reference genome at "
-          f">= 95% ANI")
+          f">= 95% ANI" + (f"; {no_hits:,} match(es) were to genomes with no alamem hits"
+                           if no_hits else ""))
     if not query_hits:
         print("  note: no query sequence is within 95% ANI of any hit genome, so "
               "filter 1 will not drop anything as a self-hit")
@@ -957,270 +981,37 @@ def first_divergence_filter(hits, query_species, index, min_identity, skani_hits
 
 
 # ===========================================================================
-# Filter 2 - compress, then pair overlapping hits from different clades
+# Filter 2 - supported regions, by sweep over query positions
 # ===========================================================================
 
-def compress(rows):
-    """Merge adjacent same-species intervals within each query sequence."""
-    groups = defaultdict(set)
-    for row in rows:
-        groups[row[0]].add(tuple(row))
-
-    compressed = []
-    for row_set in groups.values():
-        rows_sorted = sorted(row_set, key=lambda x: (int(x[_QS]), int(x[_QE]), x[_TNAME]))
-        if len(rows_sorted) <= 1:
-            continue
-
-        i = 0
-        s_cur, e_cur = int(rows_sorted[i][_QS]), int(rows_sorted[i][_QE])
-        species_cur, row_cur = rows_sorted[i][_RSP], list(rows_sorted[i])
-
-        # Unclassified rows are passed through untouched.
-        while species_cur == "unclassified" and i < len(rows_sorted):
-            s_cur, e_cur = int(rows_sorted[i][_QS]), int(rows_sorted[i][_QE])
-            species_cur, row_cur = rows_sorted[i][_RSP], list(rows_sorted[i])
-            compressed.append(tuple(row_cur))
-            i += 1
-
-        for row in rows_sorted[i:]:
-            s2, e2, species2 = int(row[_QS]), int(row[_QE]), row[_RSP]
-            if species2 == "unclassified":
-                compressed.append(tuple(row))
-                continue
-            if species2 == species_cur and overlaps(s_cur, e_cur, s2, e2):
-                e_cur = max(e_cur, e2)
-            else:
-                row_cur[_QE] = str(e_cur)
-                compressed.append(tuple(row_cur))
-                s_cur, e_cur = int(row[_QS]), int(row[_QE])
-                species_cur, row_cur = row[_RSP], list(row)
-
-        row_cur[_QE] = str(e_cur)
-        compressed.append(tuple(row_cur))
-
-    return compressed
-
-
-def find_overlap_and_div_max(rows, tree, pairs, index):
+def clade_of(index, t_name):
     """
-    Pair overlapping intervals that map to different clades, largest mutual
-    overlap first so the most informative pairs are never consumed by a smaller
-    one. Rows from different query sequences never interact.
+    The clade a reference hit belongs to.
+
+    Its tree leaf when it has one, since divergence is measured between leaves;
+    otherwise its source genome file, because one file is one organism - and in
+    a one-genome-per-species database, one species. Tagged rather than returned
+    bare so a leaf name and a file index can never collide.
     """
-    div_cache = {}
-    ani_cache = {}
-    out_rows = set()
-
-    groups = defaultdict(list)
-    for row in rows:
-        groups[row[0]].append(row)
-
-    for qrows in groups.values():
-        _pair_group(qrows, out_rows, tree, pairs, index, div_cache, ani_cache)
-
-    result = [list(r) for r in out_rows]
-    print(f"  {len(result):,} overlapping pair(s) kept")
-    return result
+    leaf = ref_leaf(index, t_name)
+    return ("leaf", leaf) if leaf != "NA" else ("file", ref_file_idx(index, t_name))
 
 
-def _pair_group(rows, out_rows, tree, pairs, index, div_cache, ani_cache):
+def merge_close_clades(clades, tree, pairs, index):
     """
-    Greedily pair overlapping rows from different clades, largest mutual overlap
-    first, each row used at most once.
+    clade -> group, merging clades too close together to be evidence of transfer.
 
-    The heap holds one entry per row - that row's best remaining partner - rather
-    than every candidate pair. The result is the same because every pair is a
-    candidate of its lower-indexed row, so the largest pair overall is always
-    some row's own best. A stale entry, one whose partner has since been taken,
-    can only overstate its overlap, so it surfaces before anything it would
-    wrongly outrank and is corrected there. That turns peak memory from one tuple
-    per candidate pair - tens of millions on a deep pileup - into one per row.
+    Two clades are distinct when the tree separates them by at least 1 MYA, or -
+    where either has no leaf, so no divergence to read - when their reference
+    sequences are below 95% ANI. That is the same test the old pairwise filter
+    applied, lifted from pairs of overlapping hits to pairs of clades. It now
+    runs once per pair of distinct clades instead of once per pair of
+    overlapping hits, which is what makes a deep pileup affordable: the cost is
+    set by how many clades were hit, not by how many times they were hit.
     """
-    n = len(rows)
-    if n <= 1:
-        return
-    rows = sorted(rows, key=lambda r: (int(r[_QS]), int(r[_QE])))
-    # Unpacked once. This is the hot loop's only input, and re-parsing these
-    # strings inside it costs more than the scanning does.
-    starts = [int(r[_QS]) for r in rows]
-    ends = [int(r[_QE]) for r in rows]
-    species = [r[_RSP] for r in rows]
-    leaves = [ref_leaf(index, r[_TNAME]) for r in rows]
-    used = [False] * n
-    rejected = set()
-
-    def best_partner(i):
-        """
-        (overlap, j) for row i's largest eligible overlap among later rows, or
-        None. Every check here is pure row data - geometry, species string, tree
-        leaf - so it needs no cache and no tree lookup; divergence and ANI stay
-        at pop time where they are asked once per pair actually taken.
-        """
-        s1, e1, sp1, leaf1 = starts[i], ends[i], species[i], leaves[i]
-        best_ov, best_j = 0, -1
-        for j in range(i + 1, n):
-            s2 = starts[j]
-            if s2 > e1:
-                break                     # sorted by start; nothing later overlaps
-            if e1 - s2 < best_ov:
-                break                     # ceiling on the rest is below what we have
-            if used[j]:
-                continue
-            # Rows are sorted by start, so s2 >= s1 and the overlap's left edge
-            # is always s2; only the right edge needs comparing.
-            e2 = ends[j]
-            ov = (e1 if e1 < e2 else e2) - s2
-            if ov <= 0 or ov <= best_ov:
-                continue
-            sp2 = species[j]
-            # 'NA' is not an identity: two references both missing from the tree
-            # are not thereby the same clade, so they stay eligible and are
-            # arbitrated by ANI at pop time.
-            if ((leaf1 == leaves[j] and leaf1 != "NA") or sp1 == sp2) \
-                    and "unclassified" not in (sp1, sp2):
-                continue                  # same clade, by leaf or by species name
-            if rejected and (i, j) in rejected:
-                continue
-            best_ov, best_j = ov, j
-            if best_ov == e1 - s1:
-                break                     # full coverage of row i, nothing better
-        return (best_ov, best_j) if best_j >= 0 else None
-
-    heap = []
-    for i in range(n):
-        candidate = best_partner(i)
-        if candidate:
-            heapq.heappush(heap, (-candidate[0], i, candidate[1]))
-
-    while heap:
-        _neg_ov, i, j = heapq.heappop(heap)
-        if used[i]:
-            continue                      # row i was consumed by a larger overlap
-        if used[j] or (rejected and (i, j) in rejected):
-            candidate = best_partner(i)   # stale; re-aim row i at what is left
-            if candidate:
-                heapq.heappush(heap, (-candidate[0], i, candidate[1]))
-            continue
-
-        row1, row2 = rows[i], rows[j]
-        leaf1, leaf2 = leaves[i], leaves[j]
-        div = check_cache(leaf1, leaf2, div_cache)
-        if div is None:
-            div = tree.divergence(leaf1, leaf2)
-            div_cache[(leaf1, leaf2)] = div
-
-        ani = "NA"
-        if isinstance(div, str):
-            id1, id2 = row1[_TNAME], row2[_TNAME]
-            ani = check_cache(id1, id2, ani_cache)
-            if ani is None:
-                ani = refs_under_95(id1, id2, pairs, index,
-                                    starts[i], ends[i], starts[j], ends[j])
-                ani_cache[(id1, id2)] = ani
-
-        if not ((not isinstance(div, str) and div >= 1) or ani is True):
-            # Too close to be evidence of transfer. Both rows stay available, so
-            # record the pair and re-aim row i rather than consuming either.
-            rejected.add((i, j))
-            candidate = best_partner(i)
-            if candidate:
-                heapq.heappush(heap, (-candidate[0], i, candidate[1]))
-            continue
-
-        out_row = []
-        for h in range(len(row1)):
-            if h in (0, 1, 9):            # Q name, Q size, Query Species
-                out_row.append(row1[h])
-            elif h == _QS:
-                out_row.append(str(max(starts[i], starts[j])))
-            elif h == _QE:
-                out_row.append(str(min(ends[i], ends[j])))
-            else:
-                out_row.append(f"{row1[h]},{row2[h]}")
-        out_row += [str(div), str(ani)]
-
-        used[i] = used[j] = True
-        out_rows.add(tuple(out_row))
-
-
-# ===========================================================================
-# Filter 3 - merge intervals, drop small ones, cluster what is left
-# ===========================================================================
-
-def _copy(iv):
-    return {"start": iv["start"], "end": iv["end"], "rows": list(iv["rows"])}
-
-
-def region_compress(ivs):
-    """Merge overlapping or directly adjacent intervals."""
-    if not ivs:
-        return []
-    ivs = sorted(ivs, key=lambda x: x["start"])
-    merged = [_copy(ivs[0])]
-    for iv in ivs[1:]:
-        last = merged[-1]
-        if iv["start"] <= last["end"] + 1:
-            last["end"] = max(last["end"], iv["end"])
-            last["rows"].extend(iv["rows"])
-        else:
-            merged.append(_copy(iv))
-    return merged
-
-
-def size_filter(ivs, min_size):
-    return [iv for iv in ivs if (iv["end"] - iv["start"]) >= min_size]
-
-
-def cluster_gap(ivs, gap):
-    """Merge intervals separated by no more than `gap` bp."""
-    if not ivs or gap <= 0:
-        return ivs
-    ivs = sorted(ivs, key=lambda x: x["start"])
-    merged = [_copy(ivs[0])]
-    for iv in ivs[1:]:
-        last = merged[-1]
-        if iv["start"] - last["end"] <= gap:
-            last["end"] = max(last["end"], iv["end"])
-            last["rows"].extend(iv["rows"])
-        else:
-            merged.append(_copy(iv))
-    return merged
-
-
-def _join(rows, col):
-    """'|'-join a field across contributing rows, one token per original pair."""
-    return "|".join(str(r.get(col, "")) for r in rows)
-
-
-def format_region_row(q_name, iv):
-    first = iv["rows"][0]
-    out = {
-        "Q name": q_name,
-        "Q size": first.get("Q size", ""),
-        "Q start": iv["start"],
-        "Q end": iv["end"],
-        "Query Species": first.get("Query Species", ""),
-    }
-    for col in META_COLS:
-        out[col] = _join(iv["rows"], col)
-    return out
-
-
-def count_clades(ref_ids, index, pairs):
-    """
-    Distinct clades among a region's reference sequences.
-
-    References with a tree leaf are counted by leaf, as before. Those without
-    one used to collapse to a single clade however unrelated they were, since
-    'NA' was doing double duty as an identity. Here they are clustered instead:
-    two join the same clade when they come from the same reference genome file,
-    or when skani put them at >= 95% ANI. Each remaining cluster counts once.
-    """
-    parent = {}
+    parent = {c: c for c in clades}
 
     def find(x):
-        parent.setdefault(x, x)
         while parent[x] != x:
             parent[x] = parent[parent[x]]
             x = parent[x]
@@ -1231,60 +1022,93 @@ def count_clades(ref_ids, index, pairs):
         if ra != rb:
             parent[ra] = rb
 
-    leaves, unplaced = set(), []
-    for ref_id in ref_ids:
-        leaf = ref_leaf(index, ref_id)
-        if leaf != "NA":
-            leaves.add(leaf)
-        else:
-            unplaced.append(ref_id)
-
-    # Two contigs of one genome are one organism whatever the ANI says - and with
-    # `triangle -i` a pair of short, non-homologous contigs may not be compared
-    # at all, which would otherwise split them.
-    first_in_file = {}
-    for ref_id in unplaced:
-        find(ref_id)
-        file_idx = ref_file_idx(index, ref_id)
-        if file_idx is None:
-            continue
-        if file_idx in first_in_file:
-            union(ref_id, first_in_file[file_idx])
-        else:
-            first_in_file[file_idx] = ref_id
-
-    for i, a in enumerate(unplaced):
-        for b in unplaced[i + 1:]:
-            if (min(a, b), max(a, b)) in pairs:
+    leaves = [c for c in clades if c[0] == "leaf"]
+    for i, a in enumerate(leaves):
+        for b in leaves[i + 1:]:
+            div = tree.divergence(a[1], b[1])
+            if not isinstance(div, str) and div < 1:
                 union(a, b)
 
-    return len(leaves) + len({find(r) for r in unplaced})
+    # Clades with no leaf are an ANI question instead, and ref_pairs already
+    # holds every reference sequence pair at >= 95%.
+    for id1, id2 in pairs:
+        c1, c2 = clade_of(index, id1), clade_of(index, id2)
+        if c1 in parent and c2 in parent:
+            union(c1, c2)
+
+    return {c: find(c) for c in clades}
 
 
-def format_summary_row(q_name, iv, index, pairs):
-    first = iv["rows"][0]
+def sweep_spans(hits, min_size, gap):
+    """
+    (start, end, peak) for every query interval covered by at least two clade
+    groups, merged across gaps of up to `gap` and dropping anything shorter
+    than `min_size`.
 
-    ref_ids = [r.strip() for row in iv["rows"]
-               for r in str(row.get("T name", "")).split(",") if r.strip()]
+    `hits` is (start, end, group) per contributing hit. Only a counter of active
+    groups is maintained, so each hit costs two events and one dict update
+    however deep the pileup gets. `peak` is the most groups covering any single
+    base in the span - the difference between two clades brushing past each
+    other and eight of them stacked on the same locus.
+    """
+    events = []
+    for start, end, group in hits:
+        events.append((start, 0, group))     # 0 sorts before 1, so a hit that
+        events.append((end, 1, group))       # ends where another starts overlaps
+    events.sort()
 
-    # Divergence times, plus which route each contributing pair came through.
-    # A numeric divergence means the tree resolved both reference leaves; the
-    # 'unk:' string means at least one was NA and the pair passed on the ANI
-    # route instead - which in representatives mode is species distinction with
-    # no divergence-time support. Recorded rather than inferred from a blank
-    # Avg Divergence Time, since a single tree-supported pair among many ANI
-    # ones would otherwise make the whole region look tree-supported.
-    div_vals, tree_pairs, ani_pairs = [], 0, 0
-    for r in iv["rows"]:
-        numeric = False
-        for v in str(r.get("Div bt Ref Species", "")).split(","):
-            try:
-                div_vals.append(float(v.strip()))
-                numeric = True
-            except ValueError:
-                pass
-        tree_pairs += numeric
-        ani_pairs += not numeric
+    active = defaultdict(int)
+    live = peak = 0
+    spans, span_start = [], None
+    for pos, kind, group in events:
+        if kind == 0:
+            active[group] += 1
+            if active[group] == 1:
+                live += 1
+                if live == 2:
+                    span_start, peak = pos, 2
+                elif live > peak and span_start is not None:
+                    peak = live
+        else:
+            active[group] -= 1
+            if active[group] == 0:
+                live -= 1
+                if live == 1 and span_start is not None:
+                    spans.append((span_start, pos, peak))
+                    span_start = None
+
+    merged = []
+    for start, end, span_peak in spans:
+        if merged and start - merged[-1][1] <= gap:
+            merged[-1][1] = max(merged[-1][1], end)
+            merged[-1][2] = max(merged[-1][2], span_peak)
+        else:
+            merged.append([start, end, span_peak])
+    return [(s, e, pk) for s, e, pk in merged if e - s >= min_size]
+
+
+def _divergence_stats(groups, tree):
+    """
+    (avg, max, evidence) over the distinct pairs of clade groups in a region.
+
+    A group is named by a leaf only if one of its clades had one; pairs where
+    either side does not are the ones that passed on ANI rather than on
+    divergence, and 'evidence' records that mix so an ANI-only call is not
+    mistaken for a tree-supported one.
+    """
+    leaves = sorted({g[1] for g in groups if g[0] == "leaf"})
+    values = []
+    tree_pairs = ani_pairs = 0
+    for i, a in enumerate(leaves):
+        for b in leaves[i + 1:]:
+            div = tree.divergence(a, b)
+            if isinstance(div, str):
+                ani_pairs += 1
+            else:
+                values.append(div)
+                tree_pairs += 1
+    n_groups = len(groups)
+    ani_pairs += n_groups * (n_groups - 1) // 2 - (tree_pairs + ani_pairs)
 
     if not ani_pairs:
         evidence = "tree"
@@ -1292,42 +1116,89 @@ def format_summary_row(q_name, iv, index, pairs):
         evidence = "ani"
     else:
         evidence = "mixed"
-
-    return {
-        "Q name": q_name,
-        "Q size": first.get("Q size", ""),
-        "Q start": iv["start"],
-        "Q end": iv["end"],
-        "Query Species": first.get("Query Species", ""),
-        "Num Regions": len(iv["rows"]),
-        "Num Unique Species": count_clades(ref_ids, index, pairs),
-        # Empty when every pair in the region came through the ANI route rather
-        # than the tree, which is a quick way to spot ANI-only calls.
-        "Avg Divergence Time": round(sum(div_vals) / len(div_vals), 4) if div_vals else "",
-        "Num Tree Pairs": tree_pairs,
-        "Evidence": evidence,
-    }
+    if not values:
+        return "", "", evidence
+    return round(sum(values) / len(values), 4), round(max(values), 4), evidence
 
 
-def clustered_regions(overlap_rows, min_size, gap, index, pairs):
-    """Returns (region_rows, summary_rows) as lists of dicts."""
-    groups = defaultdict(list)
-    for row in overlap_rows:
-        record = dict(zip(OVERLAP_HEADER, row))
-        groups[record["Q name"]].append({
-            "start": int(record["Q start"]),
-            "end": int(record["Q end"]),
-            "rows": [record],
-        })
+def supported_regions(rows, tree, pairs, index, min_size, gap):
+    """
+    Regions of the query covered by hits from two or more distinct clades.
+
+    Positions, not pairs of hits. The two are equivalent - a base covered by two
+    hits from distinct clades lies in that pair's overlap, and every base of
+    such an overlap is covered by both - but the old pairing consumed each hit
+    into at most one pair, so a third hit overlapping only one member of a
+    chosen pair could support no region at all and its interval was lost.
+
+    Returns (region_rows, summary_rows) as parallel lists of dicts: one region
+    per row, the hits that support it, and how much support that is.
+    """
+    by_query = defaultdict(list)
+    for row in rows:
+        by_query[row[0]].append(row)
+
+    clades = {clade_of(index, row[_TNAME]) for row in rows}
+    group = merge_close_clades(clades, tree, pairs, index)
+    print(f"  {len(clades):,} clade(s) among the hits, {len(set(group.values())):,} "
+          f"after merging any too close to separate")
 
     regions, summaries = [], []
-    for q_name, ivs in groups.items():
-        for iv in cluster_gap(size_filter(region_compress(ivs), min_size), gap):
-            summary = format_summary_row(q_name, iv, index, pairs)
-            if summary["Num Unique Species"] <= 1:
-                continue  # a region needs at least two distinct clades
-            regions.append(format_region_row(q_name, iv))
-            summaries.append(summary)
+    for q_name, qrows in by_query.items():
+        groups = [group[clade_of(index, r[_TNAME])] for r in qrows]
+        starts = [int(r[_QS]) for r in qrows]
+        ends = [int(r[_QE]) for r in qrows]
+        spans = sweep_spans(list(zip(starts, ends, groups)), min_size, gap)
+        if not spans:
+            continue
+
+        # Second pass for the contributing hits. Kept out of the sweep on
+        # purpose: accumulating them per event costs O(pileup depth) each time
+        # and puts the quadratic straight back in.
+        span_starts = [s for s, _e, _pk in spans]
+        members = [[] for _ in spans]
+        for i in range(len(qrows)):
+            j = bisect.bisect_right(span_starts, ends[i]) - 1
+            while j >= 0 and spans[j][1] >= starts[i]:
+                if spans[j][0] <= ends[i]:
+                    members[j].append(i)
+                j -= 1
+
+        for (start, end, peak), member in zip(spans, members):
+            if not member:
+                continue
+            first = qrows[member[0]]
+            region = {
+                "Q name": q_name,
+                "Q size": first[1],
+                "Q start": start,
+                "Q end": end,
+                "Query Species": first[9],
+            }
+            for col, position in (("T name", _TNAME), ("T size", 5),
+                                  ("T start", 6), ("T end", 7),
+                                  ("Percent Identity", 8), ("Reference Species", _RSP)):
+                region[col] = "|".join(qrows[i][position] for i in member)
+            present = {groups[i] for i in member}
+            region["Clade"] = "|".join(
+                f"{groups[i][0]}:{groups[i][1]}" for i in member)
+            avg, mx, evidence = _divergence_stats(present, tree)
+            regions.append(region)
+            summaries.append({
+                "Q name": q_name,
+                "Q size": first[1],
+                "Q start": start,
+                "Q end": end,
+                "Query Species": first[9],
+                "Num Hits": len(member),
+                "Num Clades": len(present),
+                "Peak Clades": peak,
+                "Avg Divergence Time": avg,
+                "Max Divergence Time": mx,
+                "Evidence": evidence,
+            })
+
+    print(f"  {len(summaries):,} supported region(s)")
     return regions, summaries
 
 
@@ -1424,7 +1295,7 @@ def write_region_pair(out_dir, name, stem, regions, summaries, header):
     Write a region table and its summary. Called once per step that produces
     regions, so each filter's output stays on disk like every other step's.
     """
-    region_cols = FIXED_COLS + META_COLS
+    region_cols = FIXED_COLS + REGION_META_COLS
     write_tsv(out_dir / f"{name}_{stem}.tsv", region_cols,
               [[r[c] for c in region_cols] for r in regions], header)
     write_tsv(out_dir / f"{name}_{stem}_summary.tsv", SUMMARY_COLS,
@@ -1457,10 +1328,27 @@ def cmd_run(args):
     representatives = (args.ref_representatives if args.ref_representatives is not None
                        else bool(config.get("representatives")))
 
+    # Recorded at build time like the tree, but checked on disk too, so a
+    # database sketched after it was built is still picked up.
+    sketch_db = config.get("skani_sketch") or None
+    if sketch_db and not Path(sketch_db).exists():
+        print(f"  WARNING: recorded skani sketch database {sketch_db} is missing; "
+              f"re-sketching the hit genomes for this run instead")
+        sketch_db = None
+    if not sketch_db and (db_dir / DB_SKANI_SKETCH).exists():
+        sketch_db = str(db_dir / DB_SKANI_SKETCH)
+    built_by = config.get("skani_sketch_version")
+    installed = skani_version()
+    if sketch_db and built_by and installed and ".".join(map(str, installed)) != built_by:
+        print(f"  WARNING: the sketch database was built by skani {built_by} but "
+              f"{'.'.join(map(str, installed))} is installed; sketch parameters and "
+              f"format are fixed at sketch time, so rebuild it if results look wrong.")
+
     print("Start time:", datetime.now())
     print(f"Query: {args.query}\nDatabase: {db_dir}\nTree: {tree_dir}\n"
           f"Threads: {args.threads}\n"
-          f"One genome per species: {representatives}\n")
+          f"One genome per species: {representatives}\n"
+          f"Prebuilt skani sketches: {sketch_db or 'none'}\n")
 
     tree = DivergenceTree(tree_dir)
     index = load_index(db_dir / DB_INDEX)
@@ -1478,23 +1366,20 @@ def cmd_run(args):
     # After alamem, so only the references it actually hit are compared.
     query_hits, ref_pairs = run_skani_ani(
         db_dir, [str(p) for p in query_paths],
-        {h.t_name for h in hits}, index, args.threads, out_dir, representatives)
+        {h.t_name for h in hits}, index, args.threads, out_dir, representatives,
+        sketch_db)
 
     print("Filtering out references too similar to the query...")
     first_div = first_divergence_filter(hits, query_species, index,
                                         args.min_ani, query_hits)
     write_tsv(out_dir / f"{name}_first_div_output.tsv", FIRST_DIV_HEADER, first_div, header)
 
-    print("Pairing overlapping hits...")
-    overlap = find_overlap_and_div_max(compress(first_div), tree, ref_pairs, index)
-    write_tsv(out_dir / f"{name}_overlap_div.tsv", OVERLAP_HEADER, overlap, header)
-
-    print("Building clustered regions...")
-    regions, summaries = clustered_regions(overlap, args.size_filter, args.cluster_size,
-                                           index, ref_pairs)
+    print("Finding supported regions...")
+    regions, summaries = supported_regions(first_div, tree, ref_pairs, index,
+                                           args.size_filter, args.cluster_size)
     write_region_pair(out_dir, name, "clustered_regions", regions, summaries, header)
 
-    # Filter 4 - low complexity, last so it only sees regions everything else kept.
+    # Filter 3 - low complexity, last so it only sees regions everything else kept.
     # Its own pair of files, so the pre-DUST regions above survive on disk.
     print("Filtering low-complexity regions...")
     regions, summaries, n_dust = dust_filter(regions, summaries, query_paths,
@@ -1691,6 +1576,34 @@ def build_fasta_list(inputs, out_path):
     print(f"Wrote database FASTA list ({len(inputs)} file(s)) to {out_path}")
 
 
+def build_skani_sketch(db_dir, fasta_list, threads):
+    """
+    Sketch every reference once, into a database `run` can search against.
+
+    Sketching is what dominates the per-query ANI step: `dist` reads and sketches
+    every hit genome on every run, which for a GTDB-sized reference set is
+    hundreds of Gbp of identical work each time. Doing it once here turns that
+    into loading precomputed sketches, and `skani search` screens on marker
+    sketches so only real candidates are loaded in full.
+
+    Searching the whole database rather than just the hit genomes is the trade:
+    more candidates, all marker-screened, against no sketching at all. It also
+    makes the comparison independent of which references alamem happened to hit.
+    """
+    out_dir = Path(db_dir) / DB_SKANI_SKETCH
+    if out_dir.exists():
+        print(f"Skipping skani sketch database, {out_dir} exists")
+        return out_dir
+    require_skani()
+    print(f"Sketching {fasta_list} into {out_dir}...")
+    # Through atomic() so an interrupted sketch leaves no directory for the next
+    # build to mistake for a finished one.
+    with atomic(out_dir) as tmp:
+        run_cmd(["skani", "sketch", "-t", threads, "-l", fasta_list, "-o", tmp])
+    print(f"  sketch database written to {out_dir}")
+    return out_dir
+
+
 def skani_version():
     """(major, minor, patch) from `skani -V`, or None if it cannot be parsed."""
     try:
@@ -1736,6 +1649,13 @@ def write_db_config(db_dir, args, n_reference_files):
         "reference_input": str(Path(args.input).resolve()),
         "n_reference_files": n_reference_files,
         "representatives": bool(getattr(args, "representatives", False)),
+        # The sketch database's parameters are baked in at sketch time, so the
+        # version that built it is recorded: a later skani whose defaults or
+        # sketch format differ would otherwise be used against it silently.
+        "skani_sketch": str((Path(db_dir) / DB_SKANI_SKETCH).resolve())
+                        if (Path(db_dir) / DB_SKANI_SKETCH).exists() else None,
+        "skani_sketch_version": skani_version() and ".".join(
+            map(str, skani_version())) if (Path(db_dir) / DB_SKANI_SKETCH).exists() else None,
     })
     with atomic(Path(db_dir) / DB_CONFIG) as tmp:
         tmp.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n")
@@ -1855,6 +1775,8 @@ def cmd_build_db(args):
     build_seq_lengths(inputs, db_dir / DB_SEQ_LENGTHS, args.threads)
     build_fasta_list(inputs, db_dir / DB_FASTA_LIST)
     build_index(db_dir, args.species_file, args.tree, args.representatives)
+    if args.skani_sketch:
+        build_skani_sketch(db_dir, db_dir / DB_FASTA_LIST, args.threads)
 
     write_db_config(db_dir, args, len(inputs))
 
@@ -1922,6 +1844,10 @@ def parse_args():
     build.add_argument("-s", "--species-file", required=True,
                        help="TSV of reference sequence ID and species; the divergence pairing "
                             "depends on it, so it is required")
+    build.add_argument("--skani-sketch", action="store_true",
+                       help="prebuild a skani sketch database in the database directory, so "
+                            "`run` searches precomputed sketches instead of re-sketching "
+                            "every hit genome on each query")
     build.add_argument("--representatives", action="store_true",
                        help="the reference set holds one genome per species, e.g. the GTDB "
                             "species representatives; recorded in the database so `run` can "

@@ -240,7 +240,10 @@ def get_coor(file_path, use_known):
               f"Override with --known or --no-known.")
 
     has_qsize = 'Q size' in df.columns
-    has_num_species = 'Num Unique Species' in df.columns
+    label_col = next((c for c in ('Peak Clades', 'Num Clades', 'Num Unique Species')
+                      if c in df.columns), None)
+    if label_col:
+        print(f"Labelling regions with '{label_col}'.")
     bad_names = set()
 
     for _, row in df.iterrows():
@@ -270,8 +273,8 @@ def get_coor(file_path, use_known):
                 q_sizes[id_tuple] = int(row['Q size'])
 
         raw_dict[id_tuple].append((q_start, q_end))
-        if has_num_species:
-            genome_dict[id_tuple].append((q_start, q_end, int(row['Num Unique Species'])))
+        if label_col:
+            genome_dict[id_tuple].append((q_start, q_end, int(row[label_col])))
         else:
             genome_dict[id_tuple].append((q_start, q_end))
 
