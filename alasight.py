@@ -2016,9 +2016,8 @@ def parse_args():
                      help="the database holds one genome per species, so no two references "
                           "reach 95%% ANI and the reference-vs-reference ANI can be skipped "
                           "(default: whatever build-db recorded)")
-    run.add_argument("-k", "--kmer-size", type=int, default=11,
-                     help="alamem seed k-mer size (default: 11, matching alamem's own "
-                          "default); larger is faster and less sensitive")
+    run.add_argument("-k", "--kmer-size", type=int, default=15,
+                     help="alamem seed k-mer size (default: 15, larger than alamem for large database); larger is less sensitive but reduces false positives for large databases")
     run.add_argument("--min-len", type=int, default=40,
                      help="minimum alamem hit length in bp (default: 40)")
     run.add_argument("--min-ani", type=float, default=90.0,
