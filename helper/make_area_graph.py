@@ -5,13 +5,17 @@
 # must have matplotlib installed
 
 import sys
+import re
 import pandas as pd
+import numpy as np
 import csv
 import os
 import subprocess
 try:
     import matplotlib.pyplot as plt
     import matplotlib.patches as patches
+    from matplotlib.path import Path
+    from matplotlib.patches import PathPatch
 except ModuleNotFoundError:
     print("Error: Matplotlib is not installed.")
     print("Please install Matplotlib by running: pip install matplotlib")
@@ -29,22 +33,57 @@ known = None
 X_MAX_DEFAULT = 100000
 
 # dpi both savefig calls use, so min_draw_width below can work out how many
-# pixels an axis really gets.
+# pixels an axis really gets. 300 for raster output, which is publication-grade
+# and what a reader will zoom into; vector output ignores it. min_draw_width
+# reads it, so the one-pixel floor halves when the dpi doubles - a small region
+# is drawn more faithfully at 300 than at 150. --dpi overrides it.
 SAVE_DPI = 300
+
+# Set from the output filename in __main__. A raster needs the one-pixel floor
+# in min_draw_width or sub-pixel regions vanish, but a vector file has no pixel
+# grid to accommodate: baking the floor into its geometry would widen every
+# small region permanently, and zooming in would show a rectangle several times
+# the size of the region it stands for.
+VECTOR_OUTPUT = False
+VECTOR_EXTS = ('.svg', '.svgz', '.pdf', '.eps', '.ps')
+
+# SVG unless the output name says otherwise. Vector output stores every region
+# at its true width, so a 200 bp region measures 200 bp however far out the
+# view is, and the figure can be zoomed and measured rather than only glanced
+# at. The cost is accepted deliberately: on a whole chromosome a small region
+# is a sub-pixel sliver and will look faint or invisible until zoomed. That is
+# the honest rendering. A raster cannot do it - it has to widen such a region
+# to a whole pixel to show it at all - so .png still gets the floor.
+DEFAULT_EXT = '.svg'
+
+
+def resolve_output(path):
+    """(filename, is_vector), adding DEFAULT_EXT when no extension was given."""
+    stem, ext = os.path.splitext(path)
+    if not ext:
+        ext = DEFAULT_EXT
+        path = stem + ext
+    return path, ext.lower() in VECTOR_EXTS
 
 
 def min_draw_width(ax, x_max):
     """
-    Width in data units of one pixel of this axis.
+    Width in data units of one pixel of this axis, or 0 for vector output.
 
-    A rectangle narrower than a pixel cannot be drawn honestly. On a 5 Mb
-    chromosome an axis holds roughly 2,600 bp per pixel, so a 200 bp region is
-    0.08 px wide: drawn plainly it antialiases away to nothing, and drawn with
-    the 1 pt edge this script used to give it, it paints about 4 px - a 50x
-    overstatement, which is what turned a genome with a few small regions into
-    a solid red band. Widening it to exactly one pixel keeps it visible while
-    overstating it as little as a raster allows.
+    A rectangle narrower than a pixel cannot be drawn honestly in a raster. On
+    a 5 Mb chromosome an axis holds roughly 2,600 bp per pixel, so a 200 bp
+    region is 0.08 px wide: drawn plainly it antialiases away to nothing, and
+    drawn with the 1 pt edge this script used to give it, it paints about 4 px
+    - a 50x overstatement, which is what turned a genome with a few small
+    regions into a solid red band. Widening it to exactly one pixel keeps it
+    visible while overstating it as little as a raster allows.
+
+    Vector output gets no floor. There the rectangle is stored at its true
+    width and the reader can zoom until it is visible, which is the point of
+    asking for SVG in the first place.
     """
+    if VECTOR_OUTPUT:
+        return 0.0
     fig = ax.get_figure()
     axis_px = (fig.get_size_inches()[0] * SAVE_DPI * ax.get_position().width)
     return x_max / max(1.0, axis_px)
@@ -63,6 +102,113 @@ def is_known_name(q_name):
     except ValueError:
         return False
     return True
+
+
+def raster_dpi(fig, dpi, warn_mpx=60):
+    """
+    The dpi to actually use, given how large the raster would be.
+
+    Panels stack, so a many-genome run can be a very tall figure. Merely large
+    gets a warning and proceeds; over 65,536 px in either direction matplotlib
+    fails outright, so that is capped rather than left to crash. Vector output
+    has neither limit.
+    """
+    w, h = fig.get_size_inches()
+    mpx = w * dpi * h * dpi / 1e6
+    hard = 65000 / max(w, h)
+    if dpi > hard:
+        capped = max(72, int(hard))
+        print(f"Note: {dpi} dpi would exceed matplotlib's 65,536 px limit on a "
+              f"{w:.0f} x {h:.0f} in figure; using {capped} dpi. Write .svg "
+              f"instead for unlimited resolution.")
+        return capped
+    if mpx > warn_mpx:
+        print(f"Note: {dpi} dpi gives a {w*dpi:.0f} x {h*dpi:.0f} px image "
+              f"({mpx:.0f} Mpx), which needs roughly {mpx*4:.0f} MB while it "
+              f"is written. Use --dpi 150, fewer panels, or .svg if that is "
+              f"too much.")
+    return dpi
+
+
+def _rects_path(rects):
+    """
+    One compound Path covering many rectangles, given (x0, y0, x1, y1) each.
+
+    The SVG backend writes one <path> element per artist, so a genome with
+    thousands of regions drawn as thousands of Rectangles becomes thousands of
+    elements, each repeating its own style and clip-path attributes. Collapsing
+    rectangles that share a colour into a single Path keeps every coordinate
+    exactly as it was while emitting one element for the lot.
+
+    The regions reaching here never overlap - compress() guarantees it - so
+    filling them in one path paints the same pixels as filling them one by one.
+    Where the one-pixel floor widens two neighbours into contact, one path is
+    in fact the better rendering: a single alpha 0.5 fill rather than two
+    stacked into a darker spot that means nothing.
+    """
+    r = np.asarray(rects, dtype=float)
+    n = len(r)
+    verts = np.empty((n * 5, 2))
+    verts[0::5, 0], verts[0::5, 1] = r[:, 0], r[:, 1]
+    verts[1::5, 0], verts[1::5, 1] = r[:, 2], r[:, 1]
+    verts[2::5, 0], verts[2::5, 1] = r[:, 2], r[:, 3]
+    verts[3::5, 0], verts[3::5, 1] = r[:, 0], r[:, 3]
+    verts[4::5] = verts[0::5]
+    codes = np.full(n * 5, Path.LINETO, dtype=Path.code_type)
+    codes[0::5] = Path.MOVETO
+    codes[4::5] = Path.CLOSEPOLY
+    return Path(verts, codes)
+
+
+def compact_svg(path, precision=None):
+    """
+    Rewrite the rectangle subpaths matplotlib emitted into a shorter form.
+
+    Matplotlib writes every rectangle as `M x0 y0 L x1 y0 L x1 y1 L x0 y1 z`
+    with a newline after each command - eight numbers where four will do. The
+    same corners as `M x0 y0 H x1 V y1 H x0 z` cost about 45% fewer characters,
+    and no coordinate changes, so the geometry is untouched.
+
+    `precision`, if given, also rounds coordinates to that many decimals. It is
+    off by default so the output is exactly what matplotlib computed.
+    """
+    def trim(s):
+        if precision is None:
+            return s
+        return f"{round(float(s), precision):.{precision}f}".rstrip('0').rstrip('.') or '0'
+
+    num = r'-?\d+(?:\.\d+)?'
+    rect = re.compile(
+        rf'M ({num}) ({num})\s*L ({num}) ({num})\s*L ({num}) ({num})\s*'
+        rf'L ({num}) ({num})\s*z\s*')
+
+    def repl(m):
+        x0, y0, x1 = m.group(1), m.group(2), m.group(3)
+        y1 = m.group(6)
+        return f"M{trim(x0)} {trim(y0)}H{trim(x1)}V{trim(y1)}H{trim(x0)}z"
+
+    with open(path) as f:
+        svg = f.read()
+    out, n = rect.subn(repl, svg)
+    if n:
+        with open(path, "w") as f:
+            f.write(out)
+    return len(svg), len(out), n
+
+
+def save_figure(out_path, compact, precision):
+    """Write the figure, then shrink its path data when it is plain SVG."""
+    vector = os.path.splitext(out_path)[1].lower() in VECTOR_EXTS
+    plt.savefig(out_path,
+                dpi=SAVE_DPI if vector else raster_dpi(plt.gcf(), SAVE_DPI))
+    if compact and out_path.lower().endswith('.svg'):
+        before, after, n = compact_svg(out_path, precision)
+        if n:
+            print(f"Compacted {n:,} rectangle(s): {before/1e6:.2f} MB -> "
+                  f"{after/1e6:.2f} MB ({100*(1-after/before):.0f}% smaller)"
+                  + (f", coordinates rounded to {precision} dp"
+                     if precision is not None else ", geometry unchanged"))
+    print(f"Wrote {out_path}")
 
 
 def compress(intervals):
@@ -208,8 +354,11 @@ def graph_genome(name_tuple, coordinates, row, length, plasmid_region=None, x_ma
         if p_end > max_coor:
             max_coor = p_end
 
-    # Draw detected hit regions on top (merged to avoid muddy overlap)
+    # Draw detected hit regions on top (merged to avoid muddy overlap).
+    # Collected first, then emitted as a single path: they all share one
+    # colour, so there is no reason to spend an element on each.
     min_w = min_draw_width(ax, x_max)
+    rects, labels = [], []
     for iv in coordinates:
         start1, end1 = iv[0], iv[1]
         ns = iv[2] if len(iv) > 2 else None
@@ -218,16 +367,17 @@ def graph_genome(name_tuple, coordinates, row, length, plasmid_region=None, x_ma
         # every sub-pixel region painted ~4 px of solid red and a sparse genome
         # looked fully covered. No edge, and never thinner than one pixel, so
         # a region stays visible without claiming more width than it has.
-        rect1 = patches.Rectangle(
-            (start1, 0), max(end1 - start1, min_w), 1,
-            linewidth=0, edgecolor='none', facecolor='red', alpha=0.5
-        )
-        ax.add_patch(rect1)
+        rects.append((start1, 0.0, start1 + max(end1 - start1, min_w), 1.0))
         if ns is not None:
-            ax.text((start1 + end1) / 2, 0.5, str(ns),
-                    ha='center', va='center', fontsize=7, color='darkred', fontweight='bold')
+            labels.append(((start1 + end1) / 2, ns))
         if end1 > max_coor:
             max_coor = end1
+    if rects:
+        ax.add_patch(PathPatch(_rects_path(rects), linewidth=0,
+                               edgecolor='none', facecolor='red', alpha=0.5))
+    for x_mid, ns in labels:
+        ax.text(x_mid, 0.5, str(ns), ha='center', va='center',
+                fontsize=7, color='darkred', fontweight='bold')
 
     # Hide y-axis
     ax.set_yticks([])
@@ -352,7 +502,7 @@ if __name__ == "__main__":
     if len(sys.argv) < 3:
         print("Usage: python3 make_area_graph_known.py <path_to_alasight.txt> <output_file> "
               "[--fasta sequences.fasta] [--all | --only N,N,...] [--size-filter N] [--cluster N] "
-              "[--known | --no-known]")
+              "[--known | --no-known] [--no-compact] [--svg-precision N] [--dpi N]")
         sys.exit(1)
 
     # CHANGED: was `known = True`. Default None autodetects; the flags force it.
@@ -364,7 +514,17 @@ if __name__ == "__main__":
 
     file_path = sys.argv[1]
     file_name = os.path.basename(file_path)
-    output_file = sys.argv[2]
+
+    # SVG by default; an explicit extension is honoured.
+    output_file, VECTOR_OUTPUT = resolve_output(sys.argv[2])
+    if VECTOR_OUTPUT:
+        print(f"Writing {output_file}: vector, so regions are drawn at true "
+              f"width with no one-pixel floor. Small ones are faint until "
+              f"you zoom in.")
+    else:
+        print(f"Writing {output_file}: raster, so a region narrower than a "
+              f"pixel is widened to one pixel to stay visible. Use an .svg "
+              f"name for exact widths.")
 
     fasta_lengths = {}
     if '--fasta' in sys.argv:
@@ -376,6 +536,30 @@ if __name__ == "__main__":
         print(f"Loaded lengths for {len(fasta_lengths)} sequences from FASTA.")
 
     show_all = '--all' in sys.argv
+    compact = '--no-compact' not in sys.argv
+
+    if '--dpi' in sys.argv:
+        idx = sys.argv.index('--dpi')
+        if idx + 1 >= len(sys.argv):
+            print("Error: --dpi requires an integer, e.g. --dpi 150")
+            sys.exit(1)
+        try:
+            SAVE_DPI = int(sys.argv[idx + 1])
+        except ValueError:
+            print("Error: --dpi must be an integer.")
+            sys.exit(1)
+
+    svg_precision = None
+    if '--svg-precision' in sys.argv:
+        idx = sys.argv.index('--svg-precision')
+        if idx + 1 >= len(sys.argv):
+            print("Error: --svg-precision requires an integer, e.g. 4")
+            sys.exit(1)
+        try:
+            svg_precision = int(sys.argv[idx + 1])
+        except ValueError:
+            print("Error: --svg-precision must be an integer.")
+            sys.exit(1)
 
     only_nums = set()
     if '--only' in sys.argv:
@@ -479,19 +663,26 @@ if __name__ == "__main__":
                     label='Known plasmid region'
                 ))
                 max_coor = max(max_coor, p_end)
+            min_w_inline = min_draw_width(ax, x_max)
+            rects, labels = [], []
             for iv in genome_positions[gene]:
                 start1, end1 = iv[0], iv[1]
                 ns = iv[2] if len(iv) > 2 else None
                 # FIX: as in graph_genome - no fixed-size edge, and never
                 # thinner than one pixel. See min_draw_width.
-                ax.add_patch(patches.Rectangle(
-                    (start1, 0), max(end1 - start1, min_draw_width(ax, x_max)), 1,
-                    linewidth=0, edgecolor='none', facecolor='red', alpha=0.5
-                ))
+                rects.append((start1, 0.0,
+                              start1 + max(end1 - start1, min_w_inline), 1.0))
                 if ns is not None:
-                    ax.text((start1 + end1) / 2, 0.5, str(ns),
-                            ha='center', va='center', fontsize=7, color='darkred', fontweight='bold')
+                    labels.append(((start1 + end1) / 2, ns))
                 max_coor = max(max_coor, end1)
+            # One path for the lot; they all share a colour. See _rects_path.
+            if rects:
+                ax.add_patch(PathPatch(_rects_path(rects), linewidth=0,
+                                       edgecolor='none', facecolor='red',
+                                       alpha=0.5))
+            for x_mid, ns in labels:
+                ax.text(x_mid, 0.5, str(ns), ha='center', va='center',
+                        fontsize=7, color='darkred', fontweight='bold')
 
             ax.set_yticks([])
             ax.set_yticklabels([])
@@ -503,8 +694,7 @@ if __name__ == "__main__":
 
         plt.tight_layout()
         plt.subplots_adjust(hspace=0.8)
-        out_path = output_file
-        plt.savefig(out_path, dpi=SAVE_DPI)
+        save_figure(output_file, compact, svg_precision)
         plt.show()
         plt.close(fig)
     else:
@@ -527,6 +717,10 @@ if __name__ == "__main__":
             gene_num += num_rows
             plt.tight_layout()
             plt.subplots_adjust(hspace=0.8)
-            plt.savefig(f'{output_file}_plot_{i+1}.png', dpi=SAVE_DPI)
+            # Keep the format the output name asked for, so a request for .svg
+            # is not silently written as .png with VECTOR_OUTPUT set for it.
+            stem, ext = os.path.splitext(output_file)
+            save_figure(f'{stem}_plot_{i+1}{ext or ".png"}', compact,
+                        svg_precision)
             plt.show()
             plt.close(fig)
