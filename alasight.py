@@ -37,8 +37,19 @@ relatives are removed by a skani ANI check, not by taxonomy.
   <name>_overlap_div.tsv               overlapping hit pairs from different clades
   <name>_clustered_regions.tsv         merged / size-filtered / clustered regions
   <name>_clustered_regions_summary.tsv one row per clustered region
+  <name>_clustered_regions_depth.tsv   those regions cut at every depth change
   <name>_dust_regions.tsv              regions left after DUST masking
   <name>_dust_regions_summary.tsv      one row per surviving region
+  <name>_dust_regions_depth.tsv        those regions cut at every depth change
+
+The two _depth.tsv files are what --no-depth turns off. A summary row says only
+that some base of the region had two or more clades on it; a depth row says how
+many, over a stretch where that number does not change, so the regions can be
+drawn as a coverage track rather than as a flat shaded block.
+
+Coordinates are half-open throughout: a hit's Q end, and a region's, is one
+past the last base, so an interval covers start .. end-1 and its length is
+end - start. Two intervals that abut share no base.
 
 Examples:
   alasight.py build-db -i genomes.txt -d gtdb_db -tr timetree/ \\
@@ -56,6 +67,7 @@ import contextlib
 import csv
 import gzip
 import json
+import math
 import os
 import re
 import shutil
@@ -111,6 +123,10 @@ FIXED_COLS = ["Q name", "Q size", "Q start", "Q end", "Query Species"]
 # How much support a region has, and of what kind.
 SUMMARY_COLS = FIXED_COLS + ["Num Hits", "Num Clades", "Peak Clades",
                              "Avg Divergence Time", "Max Divergence Time", "Evidence"]
+# A region cut into stretches of constant depth. "Q start"/"Q end" are the
+# stretch; "Region Q start"/"Region Q end" are the region it came out of.
+DEPTH_COLS = FIXED_COLS + ["Region Q start", "Region Q end", "Region Index",
+                           "Depth", "Log2 Depth", "Num Clades", "Num Hits", "Clades"]
 
 AlamemHit = namedtuple(
     "AlamemHit",
@@ -261,8 +277,15 @@ def check_cache(a, b, cache):
 
 
 def overlaps(start1, end1, start2, end2):
-    """Size of the overlap between two closed intervals, or None."""
-    if max(start1, start2) <= min(end1, end2):
+    """
+    Size of the overlap between two half-open intervals, or None.
+
+    Half-open because a hit's Q end and T end are one past the last base, so
+    intervals that merely abut share nothing. Returning None rather than 0 for
+    that case makes no difference to the one caller - crude_ani_overlap turns
+    both into an ANI below 95 - but it keeps the answer honest.
+    """
+    if max(start1, start2) < min(end1, end2):
         return min(end1, end2) - max(start1, start2)
     return None
 
@@ -1045,37 +1068,49 @@ def sweep_spans(hits, min_size, gap):
     groups, merged across gaps of up to `gap` and dropping anything shorter
     than `min_size`.
 
-    `hits` is (start, end, group) per contributing hit. Only a counter of active
+    `hits` is (start, end, group) per contributing hit, half-open [start, end)
+    because a hit's Q end is one past its last base. Only a counter of active
     groups is maintained, so each hit costs two events and one dict update
     however deep the pileup gets. `peak` is the most groups covering any single
     base in the span - the difference between two clades brushing past each
     other and eight of them stacked on the same locus.
+
+    Every event at a coordinate is applied before the counter is read, so
+    `live` is the number of groups covering that base and nothing else. Two
+    consequences, both wrong in the older event-at-a-time version: hits that
+    merely abut do not count as overlapping, so no span opens between them and
+    no peak is inflated by one; and a clade leaving exactly where another
+    arrives does not split a span, because the counter never dips.
     """
-    events = []
+    events = defaultdict(list)
     for start, end, group in hits:
-        events.append((start, 0, group))     # 0 sorts before 1, so a hit that
-        events.append((end, 1, group))       # ends where another starts overlaps
-    events.sort()
+        if end <= start:
+            continue                         # covers no base, so no events
+        events[start].append((group, 1))
+        events[end].append((group, -1))
 
     active = defaultdict(int)
     live = peak = 0
     spans, span_start = [], None
-    for pos, kind, group in events:
-        if kind == 0:
-            active[group] += 1
-            if active[group] == 1:
-                live += 1
-                if live == 2:
-                    span_start, peak = pos, 2
-                elif live > peak and span_start is not None:
-                    peak = live
-        else:
-            active[group] -= 1
-            if active[group] == 0:
-                live -= 1
-                if live == 1 and span_start is not None:
-                    spans.append((span_start, pos, peak))
-                    span_start = None
+    for pos in sorted(events):
+        for group, delta in events[pos]:
+            if delta > 0:
+                active[group] += 1
+                if active[group] == 1:
+                    live += 1
+            else:
+                active[group] -= 1
+                if active[group] == 0:
+                    live -= 1
+                    del active[group]        # so len(active) == live
+        if live >= 2:
+            if span_start is None:
+                span_start, peak = pos, live
+            else:
+                peak = max(peak, live)
+        elif span_start is not None:
+            spans.append((span_start, pos, peak))
+            span_start = None
 
     merged = []
     for start, end, span_peak in spans:
@@ -1131,8 +1166,10 @@ def supported_regions(rows, tree, pairs, index, min_size, gap):
     into at most one pair, so a third hit overlapping only one member of a
     chosen pair could support no region at all and its interval was lost.
 
-    Returns (region_rows, summary_rows) as parallel lists of dicts: one region
-    per row, the hits that support it, and how much support that is.
+    Returns (region_rows, summary_rows, group) - the first two parallel lists of
+    dicts, one region per row, the hits that support it, and how much support
+    that is. `group` is the clade -> group map, handed back so depth_rows can
+    reuse it instead of paying for merge_close_clades a second time.
     """
     by_query = defaultdict(list)
     for row in rows:
@@ -1155,12 +1192,16 @@ def supported_regions(rows, tree, pairs, index, min_size, gap):
         # Second pass for the contributing hits. Kept out of the sweep on
         # purpose: accumulating them per event costs O(pileup depth) each time
         # and puts the quadratic straight back in.
+        #
+        # Half-open on both sides: hit [s, e) meets span [S, E) only where
+        # S < e and s < E, so a hit that stops exactly at a span's start, or
+        # starts exactly at its end, shares no base with it and is not a member.
         span_starts = [s for s, _e, _pk in spans]
         members = [[] for _ in spans]
         for i in range(len(qrows)):
-            j = bisect.bisect_right(span_starts, ends[i]) - 1
-            while j >= 0 and spans[j][1] >= starts[i]:
-                if spans[j][0] <= ends[i]:
+            j = bisect.bisect_left(span_starts, ends[i]) - 1
+            while j >= 0 and spans[j][1] > starts[i]:
+                if spans[j][0] < ends[i]:
                     members[j].append(i)
                 j -= 1
 
@@ -1199,7 +1240,154 @@ def supported_regions(rows, tree, pairs, index, min_size, gap):
             })
 
     print(f"  {len(summaries):,} supported region(s)")
-    return regions, summaries
+    return regions, summaries, group
+
+
+# ===========================================================================
+# Depth of coverage
+# ===========================================================================
+
+def depth_track(intervals):
+    """
+    A whole query's coverage track: [(start, end, groups, hits), ...].
+
+    `intervals` is (start, end, group, hit_id) per hit, half-open [start, end)
+    like everything else, so a segment's length is end - start - the same
+    measure size_filter and the DUST filter apply to a region. Segments are the
+    stretches between consecutive hit boundaries, and nothing changes inside one
+    by construction, so `groups` and `hits` are the exact sets covering every
+    base of it rather than a maximum or an average. Uncovered stretches are left
+    out; the caller fills them in against the region it is cutting.
+
+    This keeps the covering sets where sweep_spans deliberately keeps only a
+    counter, so it costs O(pileup depth) per segment instead of O(1). That is
+    the price of a per-base answer, and it buys a track whose size is the size
+    of the file it is written to.
+    """
+    events = defaultdict(list)
+    for start, end, grp, hit_id in intervals:
+        if end <= start:
+            continue                       # covers no base, so no events
+        events[start].append((grp, hit_id, 1))
+        events[end].append((grp, hit_id, -1))
+
+    active_groups = defaultdict(int)
+    active_hits = set()
+    track, prev = [], None
+    for pos in sorted(events):
+        if prev is not None and active_hits:
+            track.append((prev, pos,
+                          frozenset(active_groups), frozenset(active_hits)))
+        for grp, hit_id, delta in events[pos]:
+            if delta == 1:
+                active_groups[grp] += 1
+                active_hits.add(hit_id)
+            else:
+                active_groups[grp] -= 1
+                if active_groups[grp] == 0:
+                    del active_groups[grp]  # so the keys are the live groups
+                active_hits.discard(hit_id)
+        prev = pos
+    return track
+
+
+def depth_rows(rows, group, index, summaries):
+    """
+    Every region in `summaries` cut into maximal runs of constant depth.
+
+    Depth is how many distinct clade groups cover a base, the per-base quantity
+    Peak Clades reports the maximum of. A region is one summary row however its
+    depth varies inside it, so a picture drawn from the summary can only shade
+    "two or more clades somewhere in here". These rows carry the number itself,
+    one row per stretch over which it does not change.
+
+    Cuts fall where the depth changes and at the region's own edges, so a
+    region's rows tile it exactly - no gaps, no overlap, lengths summing to
+    Q end - Q start. Depth 1, or 0, can appear inside a region that
+    --cluster-size merged across a gap: those rows are kept, because a bridged
+    gap is exactly what a depth chart is worth drawing for. Log2 Depth is blank
+    at depth 0.
+
+    Depth counts groups covering every base of a run; Num Clades counts groups
+    appearing anywhere in it, so the two differ where clades swap in and out
+    across a cut that did not change the total. Num Hits counts hits overlapping
+    the run, as it does per region in the summary.
+
+    A region of zero length gets no rows, having no bases to describe, though
+    sweep_spans no longer emits one.
+
+    The deepest row of a region equals the Peak Clades on its summary row, by
+    construction: sweep_spans counts the groups covering a base under the same
+    half-open reading, so the two cannot disagree.
+    """
+    by_query = defaultdict(list)
+    for row in rows:
+        by_query[row[0]].append(row)
+
+    # Grouped by query and ascending within it, which is the order
+    # supported_regions appended them in, so the output follows the summary.
+    by_region = defaultdict(list)
+    for i, summary in enumerate(summaries):
+        by_region[summary["Q name"]].append(i)
+
+    out = []
+    for q_name, region_idxs in by_region.items():
+        qrows = by_query.get(q_name, [])
+        track = depth_track(
+            (int(r[_QS]), int(r[_QE]), group[clade_of(index, r[_TNAME])], i)
+            for i, r in enumerate(qrows))
+        ends = [seg[1] for seg in track]
+
+        for region_i in region_idxs:
+            summary = summaries[region_i]
+            r_start, r_end = int(summary["Q start"]), int(summary["Q end"])
+
+            # Walk the region, taking each segment that overlaps it and calling
+            # anything between them depth 0.
+            pieces = []
+            pos = r_start
+            j = bisect.bisect_right(ends, r_start)
+            while pos < r_end:
+                if j >= len(track) or track[j][0] >= r_end:
+                    pieces.append([pos, r_end, 0, set(), set()])
+                    break
+                seg_start, seg_end, groups, hits = track[j]
+                if seg_start > pos:
+                    pieces.append([pos, seg_start, 0, set(), set()])
+                    pos = seg_start
+                stop = min(seg_end, r_end)
+                pieces.append([pos, stop, len(groups), set(groups), set(hits)])
+                pos = stop
+                j += 1
+
+            merged = []
+            for start, stop, depth, groups, hits in pieces:
+                if merged and merged[-1][2] == depth:
+                    merged[-1][1] = stop
+                    merged[-1][3] |= groups
+                    merged[-1][4] |= hits
+                else:
+                    merged.append([start, stop, depth, groups, hits])
+
+            for start, stop, depth, groups, hits in merged:
+                out.append({
+                    "Q name":         q_name,
+                    "Q size":         summary["Q size"],
+                    "Q start":        start,
+                    "Q end":          stop,
+                    "Query Species":  summary["Query Species"],
+                    "Region Q start": r_start,
+                    "Region Q end":   r_end,
+                    "Region Index":   region_i,
+                    "Depth":          depth,
+                    "Log2 Depth":     round(math.log2(depth), 4) if depth else "",
+                    "Num Clades":     len(groups),
+                    "Num Hits":       len(hits),
+                    "Clades":         "|".join(sorted(f"{k}:{v}" for k, v in groups)),
+                })
+
+    print(f"  {len(out):,} constant-depth row(s) over {len(summaries):,} region(s)")
+    return out
 
 
 # ===========================================================================
@@ -1301,6 +1489,14 @@ def write_region_pair(out_dir, name, stem, regions, summaries, header):
     write_tsv(out_dir / f"{name}_{stem}_summary.tsv", SUMMARY_COLS,
               [[s[c] for c in SUMMARY_COLS] for s in summaries], header)
 
+
+def write_depth(out_dir, name, stem, rows, group, index, summaries, header):
+    """Write the depth track for one step's regions, beside its summary."""
+    depth = depth_rows(rows, group, index, summaries)
+    write_tsv(out_dir / f"{name}_{stem}_depth.tsv", DEPTH_COLS,
+              [[d[c] for c in DEPTH_COLS] for d in depth], header)
+
+
 def cmd_run(args):
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1375,9 +1571,13 @@ def cmd_run(args):
     write_tsv(out_dir / f"{name}_first_div_output.tsv", FIRST_DIV_HEADER, first_div, header)
 
     print("Finding supported regions...")
-    regions, summaries = supported_regions(first_div, tree, ref_pairs, index,
-                                           args.size_filter, args.cluster_size)
+    regions, summaries, group = supported_regions(first_div, tree, ref_pairs, index,
+                                                  args.size_filter, args.cluster_size)
     write_region_pair(out_dir, name, "clustered_regions", regions, summaries, header)
+    if args.depth:
+        print("Building depth track...")
+        write_depth(out_dir, name, "clustered_regions", first_div, group, index,
+                    summaries, header)
 
     # Filter 3 - low complexity, last so it only sees regions everything else kept.
     # Its own pair of files, so the pre-DUST regions above survive on disk.
@@ -1389,6 +1589,9 @@ def cmd_run(args):
     dust_header = header + (f"# dust filter: dropped {n_dust} region(s) with masked "
                             f"fraction >= {args.max_masked_frac}\n#\n")
     write_region_pair(out_dir, name, "dust_regions", regions, summaries, dust_header)
+    if args.depth:
+        write_depth(out_dir, name, "dust_regions", first_div, group, index,
+                    summaries, dust_header)
 
     print("ALASIGHT FINISHED")
     print("End time:", datetime.now())
@@ -1824,6 +2027,9 @@ def parse_args():
                      help="drop clustered regions smaller than this many bp (default: 150)")
     run.add_argument("--cluster-size", type=int, default=0,
                      help="merge clustered regions within this many bp (default: 0)")
+    run.add_argument("--depth", action=argparse.BooleanOptionalAction, default=True,
+                     help="also write a clade-depth track beside each region summary, one "
+                          "row per stretch of constant depth within a region (default: on)")
     run.add_argument("--max-masked-frac", type=float, default=0.5,
                      help="drop a clustered region when this fraction or more of its bases are "
                           "DUST-masked; any value above 1 disables the filter (default: 0.5)")
