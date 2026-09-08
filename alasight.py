@@ -122,11 +122,13 @@ _RSP = 10     # Reference Species
 FIXED_COLS = ["Q name", "Q size", "Q start", "Q end", "Query Species"]
 # How much support a region has, and of what kind.
 SUMMARY_COLS = FIXED_COLS + ["Num Hits", "Num Clades", "Peak Clades",
+                             "Tree Leaves Hit", "Tree Leaves In LCA",
                              "Avg Divergence Time", "Max Divergence Time", "Evidence"]
 # A region cut into stretches of constant depth. "Q start"/"Q end" are the
 # stretch; "Region Q start"/"Region Q end" are the region it came out of.
 DEPTH_COLS = FIXED_COLS + ["Region Q start", "Region Q end", "Region Index",
-                           "Depth", "Log2 Depth", "Num Clades", "Num Hits", "Clades"]
+                           "Depth", "Log2 Depth", "Num Clades", "Num Hits",
+                           "Tree Leaves Hit", "Tree Leaves In LCA", "Clades"]
 
 AlamemHit = namedtuple(
     "AlamemHit",
@@ -431,6 +433,108 @@ class DivergenceTree:
 # ===========================================================================
 # Database index, and reference-vs-reference ANI computed per run
 # ===========================================================================
+
+class SubtreeIndex:
+    """
+    How many of the database's tree nodes sit under the LCA of a set of them.
+
+    Built from what a tree directory already holds, so an existing one needs no
+    rebuild. Three things are recovered from the Euler tour:
+
+    * A node's subtree is the widest run of tour steps around it whose depths
+      never drop below its own. Each end is a binary search over the range
+      minimum table, O(log tour).
+    * A node lies in that subtree exactly when its last tour step - the one step
+      node_dist records - falls inside the run. Prefix-summing an indicator over
+      the database's nodes therefore counts them in a range in O(1).
+    * The right-hand end of the run IS the LCA's own last step, so its name
+      comes from the same lookup. Note that node_dists.tsv holds one line per
+      NAMED node in preorder and is shorter than the tour, so node_names cannot
+      be indexed by a tour step.
+
+    `db_nodes` is the set of tree nodes the database can reach - the fourth
+    column of the index, minus 'NA'. Mostly leaves, but leaf_match's 'genus'
+    route resolves to a named internal genus node, and counting those by their
+    last tour step puts them in exactly the subtrees that contain them.
+    """
+
+    def __init__(self, tree, db_nodes):
+        self.tree = tree
+        self.depths = np.asarray(tree.mins[0])
+        tour = self.depths.size
+
+        # A node's last tour step is unique to it, so marking those steps counts
+        # each database node once, wherever it sits in the tree.
+        in_db = np.zeros(tour, dtype=bool)
+        self.n_missing = 0
+        for name in db_nodes:
+            rec = tree.node_dist.get(name)
+            if rec is None:
+                self.n_missing += 1       # in the index but not in this tree
+                continue
+            in_db[rec[1]] = True
+        self.db_cum = np.concatenate([[0], np.cumsum(in_db)])
+        self.n_db = int(in_db.sum())
+        self._cache = {}
+
+    def _range_min(self, i, j):
+        """Smallest depth in depths[i:j]."""
+        m = int(np.log2(j - i))
+        return int(min(self.tree.mins[m, i], self.tree.mins[m, j - 2 ** m]))
+
+    def _subtree(self, step):
+        """(first, last) tour steps of the node occupying `step`."""
+        d = int(self.depths[step])
+        lo, hi = 0, step
+        while lo < hi:                    # earliest step whose range min is d
+            mid = (lo + hi) // 2
+            if self._range_min(mid, step + 1) == d:
+                hi = mid
+            else:
+                lo = mid + 1
+        first = lo
+        lo, hi = step, self.depths.size - 1
+        while lo < hi:                    # latest such step
+            mid = (lo + hi + 1) // 2
+            if self._range_min(step, mid + 1) == d:
+                lo = mid
+            else:
+                hi = mid - 1
+        return first, lo
+
+    def under_lca(self, names):
+        """
+        Database nodes under the LCA of `names`, or 0 when none are in the tree.
+
+        A single name gives its own subtree, so the answer is 1 - itself. That
+        is not a special case to hide: the pair of counts reads 1 and 1, which
+        says plainly that there was nothing to compare it against.
+
+        Memoised on the set of names. A region's depth rows are cut at every
+        change in depth, so consecutive rows keep asking about the same handful
+        of clades; on a large track the distinct sets number a fraction of the
+        rows.
+        """
+        key = frozenset(names)
+        hit = self._cache.get(key)
+        if hit is not None:
+            return hit
+        steps = [self.tree.node_dist[n][1]
+                 for n in key if n in self.tree.node_dist]
+        if not steps:
+            self._cache[key] = 0
+            return 0
+        lca_step = self.tree._min_index(min(steps), max(steps) + 1)
+        first, last = self._subtree(lca_step)
+        count = int(self.db_cum[last + 1] - self.db_cum[first])
+        self._cache[key] = count
+        return count
+
+
+def db_tree_nodes(index):
+    """Every tree node the database can reach, from the index's leaf column."""
+    return {rec[2] for rec in index.values() if rec[2] != "NA"}
+
 
 def load_index(path):
     """seq_id -> (species, length, tree_leaf_name, file_index)"""
@@ -1156,7 +1260,7 @@ def _divergence_stats(groups, tree):
     return round(sum(values) / len(values), 4), round(max(values), 4), evidence
 
 
-def supported_regions(rows, tree, pairs, index, min_size, gap):
+def supported_regions(rows, tree, pairs, index, min_size, gap, subtree):
     """
     Regions of the query covered by hits from two or more distinct clades.
 
@@ -1182,7 +1286,9 @@ def supported_regions(rows, tree, pairs, index, min_size, gap):
 
     regions, summaries = [], []
     for q_name, qrows in by_query.items():
-        groups = [group[clade_of(index, r[_TNAME])] for r in qrows]
+        # Once per hit, then reused for both the merged group and the raw leaf.
+        raw = [clade_of(index, r[_TNAME]) for r in qrows]
+        groups = [group[c] for c in raw]
         starts = [int(r[_QS]) for r in qrows]
         ends = [int(r[_QE]) for r in qrows]
         spans = sweep_spans(list(zip(starts, ends, groups)), min_size, gap)
@@ -1221,6 +1327,7 @@ def supported_regions(rows, tree, pairs, index, min_size, gap):
                                   ("Percent Identity", 8), ("Reference Species", _RSP)):
                 region[col] = "|".join(qrows[i][position] for i in member)
             present = {groups[i] for i in member}
+            leaves = {raw[i][1] for i in member if raw[i][0] == "leaf"}
             region["Clade"] = "|".join(
                 f"{groups[i][0]}:{groups[i][1]}" for i in member)
             avg, mx, evidence = _divergence_stats(present, tree)
@@ -1234,6 +1341,8 @@ def supported_regions(rows, tree, pairs, index, min_size, gap):
                 "Num Hits": len(member),
                 "Num Clades": len(present),
                 "Peak Clades": peak,
+                "Tree Leaves Hit": len(leaves),
+                "Tree Leaves In LCA": subtree.under_lca(leaves),
                 "Avg Divergence Time": avg,
                 "Max Divergence Time": mx,
                 "Evidence": evidence,
@@ -1291,7 +1400,7 @@ def depth_track(intervals):
     return track
 
 
-def depth_rows(rows, group, index, summaries):
+def depth_rows(rows, group, index, summaries, subtree):
     """
     Every region in `summaries` cut into maximal runs of constant depth.
 
@@ -1307,6 +1416,11 @@ def depth_rows(rows, group, index, summaries):
     --cluster-size merged across a gap: those rows are kept, because a bridged
     gap is exactly what a depth chart is worth drawing for. Log2 Depth is blank
     at depth 0.
+
+    Tree Leaves Hit and Tree Leaves In LCA are counted over the leaves
+    appearing anywhere in the run, matching Num Clades and Num Hits rather than
+    Depth - a stretch is described by what is on it, not only by what covers
+    every base of it.
 
     Depth counts groups covering every base of a run; Num Clades counts groups
     appearing anywhere in it, so the two differ where clades swap in and out
@@ -1333,8 +1447,9 @@ def depth_rows(rows, group, index, summaries):
     out = []
     for q_name, region_idxs in by_region.items():
         qrows = by_query.get(q_name, [])
+        raw = [clade_of(index, r[_TNAME]) for r in qrows]
         track = depth_track(
-            (int(r[_QS]), int(r[_QE]), group[clade_of(index, r[_TNAME])], i)
+            (int(r[_QS]), int(r[_QE]), group[raw[i]], i)
             for i, r in enumerate(qrows))
         ends = [seg[1] for seg in track]
 
@@ -1370,6 +1485,7 @@ def depth_rows(rows, group, index, summaries):
                     merged.append([start, stop, depth, groups, hits])
 
             for start, stop, depth, groups, hits in merged:
+                leaves = {raw[i][1] for i in hits if raw[i][0] == "leaf"}
                 out.append({
                     "Q name":         q_name,
                     "Q size":         summary["Q size"],
@@ -1383,6 +1499,8 @@ def depth_rows(rows, group, index, summaries):
                     "Log2 Depth":     round(math.log2(depth), 4) if depth else "",
                     "Num Clades":     len(groups),
                     "Num Hits":       len(hits),
+                    "Tree Leaves Hit": len(leaves),
+                    "Tree Leaves In LCA": subtree.under_lca(leaves),
                     "Clades":         "|".join(sorted(f"{k}:{v}" for k, v in groups)),
                 })
 
@@ -1490,9 +1608,9 @@ def write_region_pair(out_dir, name, stem, regions, summaries, header):
               [[s[c] for c in SUMMARY_COLS] for s in summaries], header)
 
 
-def write_depth(out_dir, name, stem, rows, group, index, summaries, header):
+def write_depth(out_dir, name, stem, rows, group, index, summaries, subtree, header):
     """Write the depth track for one step's regions, beside its summary."""
-    depth = depth_rows(rows, group, index, summaries)
+    depth = depth_rows(rows, group, index, summaries, subtree)
     write_tsv(out_dir / f"{name}_{stem}_depth.tsv", DEPTH_COLS,
               [[d[c] for c in DEPTH_COLS] for d in depth], header)
 
@@ -1571,13 +1689,18 @@ def cmd_run(args):
     write_tsv(out_dir / f"{name}_first_div_output.tsv", FIRST_DIV_HEADER, first_div, header)
 
     print("Finding supported regions...")
+    subtree = SubtreeIndex(tree, db_tree_nodes(index))
+    print(f"  {subtree.n_db:,} distinct tree node(s) reachable from the database"
+          + (f"; {subtree.n_missing:,} index leaf name(s) are absent from this tree"
+             if subtree.n_missing else ""))
     regions, summaries, group = supported_regions(first_div, tree, ref_pairs, index,
-                                                  args.size_filter, args.cluster_size)
+                                                  args.size_filter, args.cluster_size,
+                                                  subtree)
     write_region_pair(out_dir, name, "clustered_regions", regions, summaries, header)
     if args.depth:
         print("Building depth track...")
         write_depth(out_dir, name, "clustered_regions", first_div, group, index,
-                    summaries, header)
+                    summaries, subtree, header)
 
     # Filter 3 - low complexity, last so it only sees regions everything else kept.
     # Its own pair of files, so the pre-DUST regions above survive on disk.
@@ -1591,7 +1714,7 @@ def cmd_run(args):
     write_region_pair(out_dir, name, "dust_regions", regions, summaries, dust_header)
     if args.depth:
         write_depth(out_dir, name, "dust_regions", first_div, group, index,
-                    summaries, dust_header)
+                    summaries, subtree, dust_header)
 
     print("ALASIGHT FINISHED")
     print("End time:", datetime.now())
